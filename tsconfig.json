@@ -3,18 +3,12 @@
     "target": "es2017",
     "module": "es2015",
     "outDir": "./docs/",
-    "lib": [
-      "dom",
-      "es2021"
-    ],
+    "lib": ["dom", "es2021"],
     "removeComments": true,
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "files": [
-    "fanbox-downloader.ts",
-    "types.d.ts"
-  ]
+  "files": ["fanbox-downloader.ts", "types.d.ts"]
 }
