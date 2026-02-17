@@ -81,8 +81,8 @@ export async function main() {
     const creatorId = window.location.href.match(/fanbox.cc\/@([^/]*)/)?.[1];
     const postId = window.location.href.match(/fanbox.cc\/@.*\/posts\/(\d*)/)?.[1];
     downloadObject = await searchBy(creatorId, postId);
-  } else if (window.location.href.match(/^https:\/\/(.*)\.fanbox\.cc\//)) {
-    const creatorId = window.location.href.match(/^https:\/\/(.*)\.fanbox\.cc\//)?.[1];
+  } else if (window.location.href.match(/^https:\/\/([^./]+)\.fanbox\.cc\//)) {
+    const creatorId = window.location.href.match(/^https:\/\/([^./]+)\.fanbox\.cc\//)?.[1];
     const postId = window.location.href.match(/.*\.fanbox\.cc\/posts\/(\d*)/)?.[1];
     downloadObject = await searchBy(creatorId, postId);
   } else {
@@ -224,9 +224,9 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
   const header: string = ((url: string | null) => {
     if (url) {
       const ext = url.split('.').pop() ?? '';
-      return `${postObject.getImageLinkTag(postObject.setCover('cover', ext, url))}<h5>${postName}</h5>\n`;
+      return `${postObject.getImageLinkTag(postObject.setCover('cover', ext, url))}<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n`;
     }
-    return `<h5>${postName}</h5>\n<br>\n`;
+    return `<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n<br>\n`;
   })(postInfo.coverImageUrl);
 
   let parsedText: string;
@@ -236,7 +236,7 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
       const imageTags = images.map((it) => postObject.getImageLinkTag(it)).join('<br>\n');
       const text = postInfo.body.text
         .split('\n')
-        .map((it) => `<span>${it}</span>`)
+        .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
       postObject.setHtml(`${header + imageTags}<br>\n${text}`);
       parsedText = `${postInfo.body.text}\n`;
@@ -247,7 +247,7 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
       const fileTags = files.map((it) => postObject.getAutoAssignedLinkTag(it)).join('<br>\n');
       const text = postInfo.body.text
         .split('\n')
-        .map((it) => `<span>${it}</span>`)
+        .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
       postObject.setHtml(`${header + fileTags}<br>\n${text}`);
       parsedText = `${postInfo.body.text}\n`;
@@ -270,9 +270,9 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
         .map((it) => {
           switch (it.type) {
             case 'p':
-              return `<span>${it.text}</span>`;
+              return `<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`;
             case 'header':
-              return `<h2><span>${it.text}</span></h2>`;
+              return `<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`;
             case 'file':
               return postObject.getAutoAssignedLinkTag(files[cntFile++]);
             case 'image':
@@ -314,7 +314,7 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
     case 'text': {
       const body = postInfo.body.text
         .split('\n')
-        .map((it) => `<span>${it}</span>`)
+        .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
       parsedText = postInfo.body.text;
       postObject.setHtml(header + body);
