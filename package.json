@@ -4,7 +4,8 @@
   "description": "pixiv FANBOXの投稿を投稿毎にフォルダ分け → ZIPとして一括ダウンロードするブックマークレット",
   "scripts": {
     "build": "bun build ./fanbox-downloader.ts --outfile ./docs/fanbox-downloader.min.js --format esm --target browser --minify",
-    "lint": "biome check --write ."
+    "lint": "biome check --write .",
+    "test": "bun test"
   },
   "repository": {
     "type": "git",
@@ -19,6 +20,6 @@
     "@biomejs/biome": "^2.0.0"
   },
   "dependencies": {
-    "download-helper": "github:ValerianDillon/download-helper#v3.3.0"
+    "download-helper": "github:ValerianDillon/download-helper#v3.4.0"
   }
 }

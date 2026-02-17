@@ -3,7 +3,9 @@ import { DownloadHelper, DownloadObject, DownloadUtils } from 'download-helper/d
 /**
  * ダウンローダーの管理クラス
  */
-class DownloadManage {
+const API_RATE_LIMIT_MS = 100;
+
+export class DownloadManage {
   /** ダウンロード用ユーティリティ 何かあれば適当にオーバライドする */
   public static readonly utils = new DownloadUtils();
 
@@ -14,9 +16,9 @@ class DownloadManage {
 
   public isIgnoreFree = false;
 
-  private fees: number[] = [];
+  private fees = new Set<number>();
 
-  private tags: string[] = [];
+  private tags = new Set<string>();
 
   private isLimitAvailable = false;
 
@@ -30,16 +32,18 @@ class DownloadManage {
   }
 
   addFee(fee: number) {
-    this.fees = [...new Set([...this.fees, fee])];
+    this.fees.add(fee);
   }
 
   addTags(...tags: string[]) {
-    this.tags = [...new Set([...this.tags, ...tags])];
+    for (const tag of tags) {
+      this.tags.add(tag);
+    }
   }
 
   applyTags() {
-    const fees = this.fees.sort((a, b) => a - b).map((fee) => this.getTagByFee(fee));
-    const tags = this.tags.filter((tag) => !fees.includes(tag));
+    const fees = [...this.fees].sort((a, b) => a - b).map((fee) => this.getTagByFee(fee));
+    const tags = [...this.tags].filter((tag) => !fees.includes(tag));
     this.downloadObject.setTags([...fees, ...tags]);
   }
 
@@ -78,12 +82,12 @@ export async function main() {
     await new DownloadHelper(DownloadManage.utils).createDownloadUI('fanbox-downloader');
     return;
   } else if (window.location.origin === 'https://www.fanbox.cc') {
-    const creatorId = window.location.href.match(/fanbox.cc\/@([^/]*)/)?.[1];
-    const postId = window.location.href.match(/fanbox.cc\/@.*\/posts\/(\d*)/)?.[1];
+    const creatorId = window.location.href.match(/fanbox.cc\/@([^/]+)/)?.[1];
+    const postId = window.location.href.match(/fanbox.cc\/@.+\/posts\/(\d+)/)?.[1];
     downloadObject = await searchBy(creatorId, postId);
   } else if (window.location.href.match(/^https:\/\/([^./]+)\.fanbox\.cc\//)) {
     const creatorId = window.location.href.match(/^https:\/\/([^./]+)\.fanbox\.cc\//)?.[1];
-    const postId = window.location.href.match(/.*\.fanbox\.cc\/posts\/(\d*)/)?.[1];
+    const postId = window.location.href.match(/.*\.fanbox\.cc\/posts\/(\d+)/)?.[1];
     downloadObject = await searchBy(creatorId, postId);
   } else {
     alert(`ここどこですか(${window.location.href})`);
@@ -129,9 +133,13 @@ async function searchBy(
     alert('しらないURL');
     return;
   }
-  const plans = DownloadManage.utils.httpGetAs<Plans>(
-    `https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}`,
-  ).body;
+  let plans: Plans['body'];
+  try {
+    plans = DownloadManage.utils.httpGetAs<Plans>(`https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}`).body;
+  } catch (e) {
+    console.error('プラン情報の取得に失敗:', e);
+    plans = undefined;
+  }
   const feeMapper = new Map<number, string>();
   if (plans) {
     for (const plan of plans) {
@@ -140,11 +148,15 @@ async function searchBy(
   }
   const downloadSettings = new DownloadManage(creatorId, feeMapper);
   downloadSettings.downloadObject.setUrl(`https://www.fanbox.cc/@${creatorId}`);
-  const definedTags =
-    DownloadManage.utils
-      .httpGetAs<Tags>(`https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`)
-      .body?.map((tag) => tag.tag) ?? [];
-  downloadSettings.addTags(...definedTags);
+  try {
+    const definedTags =
+      DownloadManage.utils
+        .httpGetAs<Tags>(`https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`)
+        .body?.map((tag) => tag.tag) ?? [];
+    downloadSettings.addTags(...definedTags);
+  } catch (e) {
+    console.error('タグ情報の取得に失敗:', e);
+  }
   if (postId) addByPostInfo(downloadSettings, getPostInfoById(postId));
   else await getItemsById(downloadSettings);
   downloadSettings.applyTags();
@@ -165,13 +177,24 @@ async function getItemsById(downloadManage: DownloadManage) {
       downloadManage.setLimit(limit);
     }
   }
-  const urls = DownloadManage.utils.httpGetAs<{ body: string[] }>(
-    `https://api.fanbox.cc/post.paginateCreator?creatorId=${downloadManage.userId}`,
-  ).body;
+  let urls: string[];
+  try {
+    urls = DownloadManage.utils.httpGetAs<{ body: string[] }>(
+      `https://api.fanbox.cc/post.paginateCreator?creatorId=${downloadManage.userId}`,
+    ).body;
+  } catch (e) {
+    console.error('投稿一覧の取得に失敗:', e);
+    alert('投稿一覧の取得に失敗しました');
+    return;
+  }
   for (let i = 0; i < urls.length; i++) {
     console.log(`${i + 1}回目`);
-    await addByPostListUrl(downloadManage, urls[i]);
-    await DownloadManage.utils.sleep(100);
+    try {
+      await addByPostListUrl(downloadManage, urls[i]);
+    } catch (e) {
+      console.error(`${i + 1}回目の投稿リスト取得に失敗:`, e);
+    }
+    await DownloadManage.utils.sleep(API_RATE_LIMIT_MS);
   }
 }
 
@@ -188,7 +211,7 @@ async function addByPostListUrl(downloadManage: DownloadManage, url: string): Pr
       if (post.body) {
         addByPostInfo(downloadManage, post);
       } else if (!post.isRestricted) {
-        await DownloadManage.utils.sleep(100);
+        await DownloadManage.utils.sleep(API_RATE_LIMIT_MS);
         addByPostInfo(downloadManage, getPostInfoById(post.id));
       }
     } else break;
@@ -200,7 +223,12 @@ async function addByPostListUrl(downloadManage: DownloadManage, url: string): Pr
  * @param postId 投稿ID
  */
 function getPostInfoById(postId: string): PostInfo | undefined {
-  return DownloadManage.utils.httpGetAs<{ body?: PostInfo }>(`https://api.fanbox.cc/post.info?postId=${postId}`).body;
+  try {
+    return DownloadManage.utils.httpGetAs<{ body?: PostInfo }>(`https://api.fanbox.cc/post.info?postId=${postId}`).body;
+  } catch (e) {
+    console.error(`投稿情報の取得に失敗 (postId: ${postId}):`, e);
+    return undefined;
+  }
 }
 
 /**
@@ -273,14 +301,21 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
               return `<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`;
             case 'header':
               return `<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`;
-            case 'file':
+            case 'file': {
+              if (cntFile >= files.length) return '';
               return postObject.getAutoAssignedLinkTag(files[cntFile++]);
-            case 'image':
+            }
+            case 'image': {
+              if (cntImg >= images.length) return '';
               return postObject.getImageLinkTag(images[cntImg++]);
-            case 'embed':
+            }
+            case 'embed': {
+              if (cntEmbed >= embeds.length) return '';
               // FIXME 型が分からないのでJSON化して中身だけ出す
-              return `<span>${JSON.stringify(embeds[cntEmbed++])}</span>`;
+              return `<span>${DownloadManage.utils.escapeHtml(JSON.stringify(embeds[cntEmbed++]))}</span>`;
+            }
             case 'url_embed': {
+              if (cntUrlEmbed >= urlEmbeds.length) return '';
               const urlEmbedInfo = urlEmbeds[cntUrlEmbed++];
               switch (urlEmbedInfo.type) {
                 case 'default':
@@ -288,7 +323,9 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
                 case 'html':
                 case 'html.card': {
                   const iframeUrl = urlEmbedInfo.html.match(/<iframe.*src="(http.*)"/)?.[1];
-                  return iframeUrl ? postObject.getLinkTag(iframeUrl, 'iframe link') : `\n${urlEmbedInfo.html}\n\n`;
+                  return iframeUrl
+                    ? postObject.getLinkTag(iframeUrl, 'iframe link')
+                    : `\n${DownloadManage.utils.escapeHtml(urlEmbedInfo.html)}\n\n`;
                 }
                 case 'fanbox.post': {
                   const url = `https://www.fanbox.cc/@${urlEmbedInfo.postInfo.creatorId}/posts/${urlEmbedInfo.postInfo.id}`;
@@ -296,7 +333,7 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
                 }
                 default:
                   // FIXME 型が分からないのでJSON化して中身だけ出す
-                  return `<span>${JSON.stringify(urlEmbedInfo)}</span>`;
+                  return `<span>${DownloadManage.utils.escapeHtml(JSON.stringify(urlEmbedInfo))}</span>`;
               }
             }
             default:
@@ -348,33 +385,45 @@ function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | unde
   downloadManage.decrementLimit();
 }
 
-function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Block[]): ImageInfo[] {
+export function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Block[]): ImageInfo[] {
   const imageOrder = blocks.filter((it): it is ImageBlock => it.type === 'image').map((it) => it.imageId);
-  const imageKeyOrder = (s: string) => imageOrder.indexOf(s) ?? imageOrder.length;
+  const imageKeyOrder = (s: string) => {
+    const idx = imageOrder.indexOf(s);
+    return idx === -1 ? imageOrder.length : idx;
+  };
   return Object.keys(imageMap)
     .sort((a, b) => imageKeyOrder(a) - imageKeyOrder(b))
     .map((it) => imageMap[it]);
 }
 
-function convertFileMap(fileMap: Record<string, FileInfo>, blocks: Block[]): FileInfo[] {
+export function convertFileMap(fileMap: Record<string, FileInfo>, blocks: Block[]): FileInfo[] {
   const fileOrder = blocks.filter((it): it is FileBlock => it.type === 'file').map((it) => it.fileId);
-  const fileKeyOrder = (s: string) => fileOrder.indexOf(s) ?? fileOrder.length;
+  const fileKeyOrder = (s: string) => {
+    const idx = fileOrder.indexOf(s);
+    return idx === -1 ? fileOrder.length : idx;
+  };
   return Object.keys(fileMap)
     .sort((a, b) => fileKeyOrder(a) - fileKeyOrder(b))
     .map((it) => fileMap[it]);
 }
 
-function convertEmbedMap(embedMap: Record<string, EmbedInfo>, blocks: Block[]): EmbedInfo[] {
+export function convertEmbedMap(embedMap: Record<string, EmbedInfo>, blocks: Block[]): EmbedInfo[] {
   const embedOrder = blocks.filter((it): it is EmbedBlock => it.type === 'embed').map((it) => it.embedId);
-  const embedKeyOrder = (s: string) => embedOrder.indexOf(s) ?? embedOrder.length;
+  const embedKeyOrder = (s: string) => {
+    const idx = embedOrder.indexOf(s);
+    return idx === -1 ? embedOrder.length : idx;
+  };
   return Object.keys(embedMap)
     .sort((a, b) => embedKeyOrder(a) - embedKeyOrder(b))
     .map((it) => embedMap[it]);
 }
 
-function convertUrlEmbedMap(urlEmbedMap: Record<string, UrlEmbedInfo>, blocks: Block[]): UrlEmbedInfo[] {
+export function convertUrlEmbedMap(urlEmbedMap: Record<string, UrlEmbedInfo>, blocks: Block[]): UrlEmbedInfo[] {
   const urlEmbedOrder = blocks.filter((it): it is UrlEmbedBlock => it.type === 'url_embed').map((it) => it.urlEmbedId);
-  const urlEmbedKeyOrder = (s: string) => urlEmbedOrder.indexOf(s) ?? urlEmbedOrder.length;
+  const urlEmbedKeyOrder = (s: string) => {
+    const idx = urlEmbedOrder.indexOf(s);
+    return idx === -1 ? urlEmbedOrder.length : idx;
+  };
   return Object.keys(urlEmbedMap)
     .sort((a, b) => urlEmbedKeyOrder(a) - urlEmbedKeyOrder(b))
     .map((it) => urlEmbedMap[it]);
