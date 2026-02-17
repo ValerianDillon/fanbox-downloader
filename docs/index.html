@@ -48,17 +48,6 @@
             font-size: 80%;
         }
     </style>
-    <script async src="https://www.googletagmanager.com/gtag/js?id=G-H05HP1B634"></script>
-    <script>
-        window.dataLayer = window.dataLayer || [];
-
-        function gtag() {
-            dataLayer.push(arguments);
-        }
-
-        gtag('js', new Date());
-        gtag('config', 'G-H05HP1B634');
-    </script>
 </head>
 
 <body>
@@ -66,7 +55,7 @@
     <h2>fanbox-downloader</h2>
     <div>
         pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマークレットです。<br>
-        <a href="https://github.com/darekasan/fanbox-downloader">オリジナル</a>から好き勝手に手を加えています。
+        <a href="https://github.com/darekasan/fanbox-downloader">オリジナル</a>(<a href="https://github.com/furubarug/fanbox-downloader">furubarug版</a>経由)から好き勝手に手を加えています。
     </div>
     <br>
     <div class="code-bg">
@@ -79,7 +68,7 @@
             <button class="copy btn" type="button" id="copy">copy</button>
         </div>
         <div class="code" id="code">
-            javascript:import("https://furubarug.github.io/fanbox-downloader/fanbox-downloader.min.js").then(m=>m.main()).catch(e=>alert(`エラー出た(${e})`));
+            javascript:import("https://ValerianDillon.github.io/fanbox-downloader/fanbox-downloader.min.js").then(m=>m.main()).catch(e=>alert(`エラー出た(${e})`));
         </div>
 
         <div class="text-body">
@@ -101,8 +90,9 @@
         <div class="text-body">
             <h5>リンク</h5>
             <ul>
-                <li><a href="https://github.com/furubarug/fanbox-downloader">Github</a></li>
-                <li><a href="https://github.com/darekasan/fanbox-downloader">オリジナル(フォーク元)</a></li>
+                <li><a href="https://github.com/ValerianDillon/fanbox-downloader">Github</a></li>
+                <li><a href="https://github.com/darekasan/fanbox-downloader">オリジナル(元祖)</a></li>
+                <li><a href="https://github.com/furubarug/fanbox-downloader">furubarug版(直接のフォーク元)</a></li>
             </ul>
         </div>
     </div>

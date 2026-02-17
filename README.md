@@ -1,31 +1,37 @@
 # fanbox-downloader
-pixiv FANBOXの投稿を投稿毎にフォルダ分け → ZIPとして一括ダウンロードするブックマークレット
 
-自分用、性欲駆動開発
+pixiv FANBOXの投稿を投稿毎にフォルダ分け、ZIPとして一括ダウンロードするブックマークレット。
+
+[darekasan/fanbox-downloader](https://github.com/darekasan/fanbox-downloader) を元に
+[furubarug](https://github.com/furubarug/fanbox-downloader) がforkしたものを、
+さらにforkして独自に改変しています。
 
 ### 使い方
-- https://furubarug.github.io/fanbox-downloader/
 
-↓ブックマークレット
+https://ValerianDillon.github.io/fanbox-downloader/
+
+ブックマークレット:
 ```
-javascript:import("https://furubarug.github.io/fanbox-downloader/fanbox-downloader.min.js").then(m=>m.main()).catch(e=>alert(`エラー出た(${e})`));
+javascript:import("https://ValerianDillon.github.io/fanbox-downloader/fanbox-downloader.min.js").then(m=>m.main()).catch(e=>alert(`エラー出た(${e})`));
 ```
+
+### 機能
+
+- FANBOXクリエイターページまたは投稿ページから投稿データを収集
+- 投稿を個別フォルダに整理してZIPファイルとしてダウンロード
+- 対応コンテンツ: 画像、ファイル、記事(複合コンテンツ)、テキスト
+- 投稿のメタデータ(タイトル、日付、プラン、タグ、いいね数等)をJSON/テキストで保存
+- 投稿ごとのHTMLページ生成 (メディア埋め込み)
+- ルートindex.htmlでVue.jsによるタグフィルタリング
+- リトライ付きダウンロード、レート制限対策
 
 ### 既知の問題
-- 4GB超えるとZIP解凍時にエラーが出る（解凍ファイルに問題はないけど、うるさいツールだと解凍してくれないかも）
-- ファイル表示のリンクで`download`属性が機能してない（ファイル名重複時に元ファイル名に戻せない）
 
-### fork後の変更点
-- 対応するURLを少し増やした
-- 投稿毎にフォルダ分けしたZIPでダウンロードするよ
-- 投稿の文章とかの情報もそれっぽく保存
-- コードが長くなったから外部から読み込むようにした
+- 4GB超えるとZIP解凍時にエラーが出る(解凍ファイルに問題はないが、ツールによっては解凍不可)
+- ファイル表示のリンクで `download` 属性が機能しない(ファイル名重複時に元ファイル名に戻せない)
 
-### 開発用TIPS
-
-- tsコンパイル
+### 開発
 
 ```bash
-# yarn run build
 npm run build
 ```
