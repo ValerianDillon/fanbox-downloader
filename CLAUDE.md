@@ -27,7 +27,7 @@ docs/
 
 - TypeScript 4.x → ES2017 ターゲット、ES Module 出力
 - Webpack 5（production モード）
-- 唯一の runtime 依存: `download-helper`（GitHub の `release/X.X.X` ブランチから取得）
+- 唯一の runtime 依存: `download-helper`（GitHub の git tag `vX.X.X` から取得）
 
 ## アーキテクチャ
 
