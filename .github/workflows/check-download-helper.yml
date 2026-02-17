@@ -1,0 +1,37 @@
+name: Check download-helper updates
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for new tag
+        run: |
+          CURRENT=$(grep -oP 'download-helper#\Kv[^"]+' package.json)
+          LATEST=$(gh api repos/ValerianDillon/download-helper/tags --jq '.[0].name')
+          echo "current=$CURRENT latest=$LATEST"
+          if [ "$CURRENT" != "$LATEST" ]; then
+            sed -i "s|download-helper#${CURRENT}|download-helper#${LATEST}|" package.json
+            echo "UPDATED=true" >> $GITHUB_ENV
+            echo "NEW_TAG=$LATEST" >> $GITHUB_ENV
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: peter-evans/create-pull-request@v7
+        if: env.UPDATED == 'true'
+        with:
+          title: "Update download-helper to ${{ env.NEW_TAG }}"
+          commit-message: "Update download-helper to ${{ env.NEW_TAG }}"
+          branch: update-download-helper
+          body: |
+            download-helper の新しいタグ `${{ env.NEW_TAG }}` が検出されました。
+            自動生成された PR です。

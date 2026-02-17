@@ -5,8 +5,8 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
 
 ## コマンド
 
-- `npm run build` — webpack で `fanbox-downloader.ts` → `docs/fanbox-downloader.min.js` にバンドル
-- `npm run lint` — ESLint + Prettier による静的解析・自動修正
+- `bun run build` — `bun build --minify` で `fanbox-downloader.ts` → `docs/fanbox-downloader.min.js` にバンドル
+- `bun run lint` — Biome による静的解析・フォーマット修正
 - テストフレームワークはなし
 
 ## プロジェクト構成
@@ -14,19 +14,27 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
 ```
 fanbox-downloader.ts    # メインソース（エントリポイント、export main()）
 types.d.ts              # FANBOX API の型定義
+biome.json              # Biome 設定
+.mise.toml              # mise ツールバージョン管理
 docs/
-  fanbox-downloader.min.js  # ビルド成果物（コミット対象）
+  fanbox-downloader.min.js  # ビルド成果物（CI で自動生成、git 管理対象外）
   index.html                # GitHub Pages ランディングページ
   sitemap.xml
+.github/
+  workflows/
+    deploy-pages.yml            # master push 時にビルド + Pages デプロイ
+    check-download-helper.yml   # 週1回 download-helper の更新を検出して PR 作成
+  dependabot.yml                # GitHub Actions の自動更新
 ```
 
 - 単一ファイル構成のブックマークレット
-- ビルド成果物 `docs/fanbox-downloader.min.js` はgit管理対象。ビルド後に差分があればコミットすること
+- ビルド成果物 `docs/fanbox-downloader.min.js` は CI で自動生成されるため git 管理対象外
 
 ## 技術スタック
 
-- TypeScript 4.x → ES2017 ターゲット、ES Module 出力
-- Webpack 5（production モード）
+- Bun でバンドル + ミニファイ（TypeScript → ESM）
+- Biome で静的解析・フォーマット
+- tsconfig.json はエディタの型チェック用に維持
 - 唯一の runtime 依存: `download-helper`（GitHub の git tag `vX.X.X` から取得）
 
 ## アーキテクチャ
@@ -39,10 +47,10 @@ docs/
 
 ## コーディング規約
 
-- ESLint (airbnb-typescript/base) + Prettier で強制。設定は `package.json` 内に記載
-- インデント: タブ文字
+- Biome (recommended ルールセット) で強制。設定は `biome.json` に記載
+- インデント: スペース2つ
 - シングルクォート、セミコロンあり、末尾カンマあり
-- `printWidth: 100`
+- `lineWidth: 120`
 
 ## Git運用
 
