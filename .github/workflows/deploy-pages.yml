@@ -3,6 +3,11 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [master]
+    paths:
+      - 'fanbox-downloader.ts'
+      - 'package.json'
+      - 'bun.lock'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
