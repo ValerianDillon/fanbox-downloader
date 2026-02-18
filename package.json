@@ -1,6 +1,6 @@
 {
   "name": "fanbox-downloader",
-  "version": "3.5.1",
+  "version": "3.6.0",
   "description": "pixiv FANBOXの投稿を投稿毎にフォルダ分け → ZIPとして一括ダウンロードするブックマークレット",
   "scripts": {
     "build": "bun build ./fanbox-downloader.ts --outfile ./docs/fanbox-downloader.min.js --format esm --target browser --minify",
@@ -20,6 +20,6 @@
     "@biomejs/biome": "^2.0.0"
   },
   "dependencies": {
-    "download-helper": "github:ValerianDillon/download-helper#v3.5.0"
+    "download-helper": "github:ValerianDillon/download-helper#v3.6.0"
   }
 }

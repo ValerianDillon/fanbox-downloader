@@ -94,30 +94,12 @@ export async function main() {
     return;
   }
   if (!downloadObject) return;
-  const json = downloadObject.stringify();
-  console.log(json);
-  const jsonCopied = () => {
-    alert('jsonをコピーしました。downloads.fanbox.ccで実行して貼り付けてね');
-    if (confirm('downloads.fanbox.ccに遷移する？')) {
-      document.location.href = 'https://downloads.fanbox.cc';
-    }
-  };
-  try {
-    await navigator.clipboard.writeText(json);
-    jsonCopied();
-  } catch (_) {
-    document.body.addEventListener(
-      'click',
-      () => {
-        navigator.clipboard
-          .writeText(json)
-          .then(() => jsonCopied())
-          .catch(() => alert('jsonコピーに失敗しました。もう一度実行するかコンソールからコピーしてね'));
-      },
-      { once: true },
-    );
-    alert('jsonコピーに失敗しました。画面の適当なとこをクリック！');
-  }
+  console.log(downloadObject.stringify());
+  await new DownloadHelper(DownloadManage.utils).createDownloadOverlay(
+    'fanbox-downloader',
+    document,
+    downloadObject.toJsonObj(),
+  );
 }
 
 /**
