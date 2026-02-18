@@ -57,3 +57,4 @@ docs/
 - リモート `origin`: ValerianDillon/fanbox-downloader
 - リモート `upstream`: furubarug/fanbox-downloader（上流の変更取り込み用に維持）
 - コミットの author/committer は ValerianDillon であること
+- **`gh pr create` は fork 元 (upstream) をデフォルトのベースリポジトリにする。** 必ず `--repo ValerianDillon/fanbox-downloader --base master` を指定すること
