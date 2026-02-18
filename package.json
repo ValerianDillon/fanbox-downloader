@@ -20,6 +20,6 @@
     "@biomejs/biome": "^2.0.0"
   },
   "dependencies": {
-    "download-helper": "github:ValerianDillon/download-helper#v3.4.0"
+    "download-helper": "github:ValerianDillon/download-helper#v3.5.0"
   }
 }

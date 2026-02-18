@@ -5,7 +5,7 @@
     "": {
       "name": "fanbox-downloader",
       "dependencies": {
-        "download-helper": "github:ValerianDillon/download-helper#v3.4.0",
+        "download-helper": "github:ValerianDillon/download-helper#v3.5.0",
       },
       "devDependencies": {
         "@biomejs/biome": "^2.0.0",
@@ -31,6 +31,6 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.4.2", "", { "os": "win32", "cpu": "x64" }, "sha512-9ma7C4g8Sq3cBlRJD2yrsHXB1mnnEBdpy7PhvFrylQWQb4PoyCmPucdX7frvsSBQuFtIiKCrolPl/8tCZrKvgQ=="],
 
-    "download-helper": ["download-helper@github:ValerianDillon/download-helper#a355a02", {}, "ValerianDillon-download-helper-a355a02"],
+    "download-helper": ["download-helper@github:ValerianDillon/download-helper#bf3c283", {}, "ValerianDillon-download-helper-bf3c283"],
   }
 }
