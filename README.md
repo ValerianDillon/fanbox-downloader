@@ -21,6 +21,7 @@ javascript:import("https://ValerianDillon.github.io/fanbox-downloader/fanbox-dow
 - 投稿を個別フォルダに整理してZIPファイルとしてダウンロード
 - 対応コンテンツ: 画像、ファイル、記事(複合コンテンツ)、テキスト
 - 投稿のメタデータ(タイトル、日付、プラン、タグ、いいね数等)をJSON/テキストで保存
+- ZIP内の各ファイルのタイムスタンプ(mtime)に投稿の公開日時を設定
 - 投稿ごとのHTMLページ生成 (メディア埋め込み)
 - ルートindex.htmlでVue.jsによるタグフィルタリング
 - リトライ付きダウンロード、レート制限対策

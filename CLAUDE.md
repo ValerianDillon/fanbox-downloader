@@ -13,7 +13,6 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
 
 ```
 fanbox-downloader.ts    # メインソース（エントリポイント、export main()）
-types.d.ts              # FANBOX API の型定義
 biome.json              # Biome 設定
 .mise.toml              # mise ツールバージョン管理
 docs/
@@ -29,6 +28,9 @@ docs/
 
 - 単一ファイル構成のブックマークレット
 - ビルド成果物 `docs/fanbox-downloader.min.js` は CI で自動生成されるため git 管理対象外
+- FANBOX API の型定義・`DownloadManage`・`addByPostInfo`・`convert*Map` は
+  `download-helper/fanbox-collector`（download-helper パッケージ内、v3.7.0〜）に集約されており、
+  このリポジトリにはローカルの型定義ファイルは存在しない（`fanbox-downloader-extension` と共用）
 
 ## 技術スタック
 
@@ -42,7 +44,11 @@ docs/
 - `main()` — ブックマークレットのエントリポイント。URL パターンで動作を分岐
   - `downloads.fanbox.cc` → DownloadHelper UI を起動（download-helper パッケージ）
   - `*.fanbox.cc` / `fanbox.cc/@*` → 投稿情報を収集してクリップボードにコピー
-- `DownloadManage` クラス — ダウンロード設定（プラン・タグ・制限数）の管理
+- `DownloadManage` クラス・`addByPostInfo`（postInfo → DownloadObject への変換）・
+  `convertImageMap` 等は `download-helper/fanbox-collector` から import する共有ロジック
+  （投稿一覧取得・ページネーションなど API 呼び出し自体はこのリポジトリ固有の実装として残る）
+- `addByPostInfo` が投稿の `publishedDatetime` を `postObject.setPublishedDatetime` で記録するため、
+  ZIP 内の各ファイルの mtime に投稿日時が反映される
 - FANBOX API (`api.fanbox.cc`) を fetch で呼び出し、レート制限対策に sleep を挟む
 
 ## コーディング規約
