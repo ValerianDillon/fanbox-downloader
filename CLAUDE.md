@@ -7,7 +7,8 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
 
 - `bun run build` — `bun build --minify` で `fanbox-downloader.ts` → `docs/fanbox-downloader.min.js` にバンドル
 - `bun run lint` — Biome による静的解析・フォーマット修正
-- テストフレームワークはなし
+- `bun run typecheck` — tsc による型検査 (ビルドは bun build が行うため `--noEmit`)
+- `bun test` — ユニットテストを実行
 
 ## プロジェクト構成
 
@@ -29,7 +30,7 @@ docs/
 - 単一ファイル構成のブックマークレット
 - ビルド成果物 `docs/fanbox-downloader.min.js` は CI で自動生成されるため git 管理対象外
 - FANBOX API の型定義・`DownloadManage`・`addByPostInfo`・`convert*Map` は
-  `download-helper/fanbox-collector`（download-helper パッケージ内、v3.7.0〜）に集約されており、
+  `download-helper/fanbox-collector`（download-helper パッケージ内、v4.2.0〜）に集約されており、
   このリポジトリにはローカルの型定義ファイルは存在しない（`fanbox-downloader-extension` と共用）
 
 ## 技術スタック
@@ -50,6 +51,13 @@ docs/
 - `addByPostInfo` が投稿の `publishedDatetime` を `postObject.setPublishedDatetime` で記録するため、
   ZIP 内の各ファイルの mtime に投稿日時が反映される
 - FANBOX API (`api.fanbox.cc`) を fetch で呼び出し、レート制限対策に sleep を挟む
+  (429 のバックオフや `Retry-After` の解釈は未実装。Issue #3 を参照)
+- 配列レスポンスは `body` 直下ではなく `body.<キー>` に入る。形状が想定と違うとき、
+  プラン名とタグは表示の補助なので握りつぶして続行し、投稿一覧と投稿詳細は
+  `ApiShapeError` で中止して結果自体を返さない (途中までの結果を成功として出さないため)
+- 投稿一覧に本文は含まれないため、閲覧できる投稿はすべて `post.info` を個別に叩く
+- 取得できなかった投稿とページは件数を数えて alert で通知する
+  (`addByPostInfo` が黙って読み飛ばすため、数えないと全投稿が消えても気付けない)
 
 ## コーディング規約
 

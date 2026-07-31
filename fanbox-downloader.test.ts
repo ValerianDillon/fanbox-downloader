@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import {
   type Block,
   convertEmbedMap,
@@ -11,6 +11,7 @@ import {
   type ImageInfo,
   type UrlEmbedInfo,
 } from 'download-helper/fanbox-collector';
+import { searchBy } from './fanbox-downloader';
 
 // convert*Map / DownloadManage の実装本体は download-helper/fanbox-collector.ts に移設済み
 // (詳細なテストは download-helper リポジトリの fanbox-collector.test.ts を参照)。
@@ -156,5 +157,106 @@ describe('DownloadManage', () => {
       // fees は昇順ソート (100, 500) → ["ファン", "サポーター"] + 残りのタグ
       expect(json.tags).toEqual(['ファン', 'サポーター', 'タグA', 'タグB']);
     });
+  });
+});
+
+describe('searchBy - API レスポンスのアンラップ', () => {
+  const CREATOR_ID = 'testcreator';
+  const LIST_PAGE_URL = 'https://api.fanbox.cc/post.listCreator?creatorId=testcreator&cursor=1';
+  const POST_INFO_URL = 'https://api.fanbox.cc/post.info?postId=1001';
+
+  const POST_STUB = { id: '1001', isRestricted: false, feeRequired: 0 };
+  const POST_FULL = {
+    id: '1001',
+    title: 'リンゴ',
+    feeRequired: 0,
+    creatorId: CREATOR_ID,
+    coverImageUrl: null,
+    excerpt: '',
+    isRestricted: false,
+    tags: [],
+    publishedDatetime: '2024-01-01T00:00:00+09:00',
+    updatedDatetime: '2024-01-01T00:00:00+09:00',
+    likeCount: 0,
+    commentCount: 0,
+    type: 'text',
+    body: { text: 'hello' },
+  };
+
+  /** 一覧までは正常形状で返す共通のモック定義 */
+  const baseResponses = (): Record<string, unknown> => ({
+    [`https://api.fanbox.cc/plan.listCreator?creatorId=${CREATOR_ID}`]: { body: { plans: [] } },
+    [`https://api.fanbox.cc/tag.getFeatured?creatorId=${CREATOR_ID}`]: { body: { featuredTags: [] } },
+    [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: { body: { pageUrls: [LIST_PAGE_URL] } },
+    [LIST_PAGE_URL]: { body: { posts: [POST_STUB] } },
+    [POST_INFO_URL]: { body: { post: POST_FULL } },
+  });
+
+  // biome-ignore lint/suspicious/noExplicitAny: global stubs
+  const g = globalThis as any;
+  const orig = {
+    httpGetAs: DownloadManage.utils.httpGetAs,
+    sleep: DownloadManage.utils.sleep,
+    alert: g.alert,
+    confirm: g.confirm,
+    prompt: g.prompt,
+  };
+  let alerts: string[];
+
+  function mockApi(responses: Record<string, unknown>) {
+    alerts = [];
+    DownloadManage.utils.httpGetAs = ((url: string) => {
+      if (!(url in responses)) throw new Error(`HTTP 404: ${url}`);
+      return responses[url];
+    }) as typeof DownloadManage.utils.httpGetAs;
+    // レート制限の待機はテストでは不要
+    DownloadManage.utils.sleep = (() => Promise.resolve()) as typeof DownloadManage.utils.sleep;
+    g.alert = (message: string) => alerts.push(message);
+    g.confirm = () => false;
+    g.prompt = () => null;
+  }
+
+  afterEach(() => {
+    DownloadManage.utils.httpGetAs = orig.httpGetAs;
+    DownloadManage.utils.sleep = orig.sleep;
+    g.alert = orig.alert;
+    g.confirm = orig.confirm;
+    g.prompt = orig.prompt;
+  });
+
+  test('新形状のレスポンスから投稿を収集できる', async () => {
+    mockApi(baseResponses());
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(result).toBeDefined();
+    expect(JSON.parse(result?.stringify() ?? '{}').posts).toHaveLength(1);
+    expect(alerts).toEqual([]);
+  });
+
+  test.each([
+    ['post.paginateCreator', `https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`, { body: [] }],
+    ['post.listCreator', LIST_PAGE_URL, { body: [POST_STUB] }],
+    ['post.info', POST_INFO_URL, { body: POST_FULL }],
+  ])('%s が旧形状なら結果を返さない', async (_name, url, oldShape) => {
+    mockApi({ ...baseResponses(), [url]: oldShape });
+    // 途中まで集めた中身のない結果を成功として出さないこと
+    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    expect(alerts.length).toBeGreaterThan(0);
+  });
+
+  test('plan / tag が旧形状でも収集は続く (表示の補助でしかないため)', async () => {
+    mockApi({
+      ...baseResponses(),
+      [`https://api.fanbox.cc/plan.listCreator?creatorId=${CREATOR_ID}`]: { body: [{ fee: 500, title: 'x' }] },
+      [`https://api.fanbox.cc/tag.getFeatured?creatorId=${CREATOR_ID}`]: { body: [{ tag: 'x' }] },
+    });
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(JSON.parse(result?.stringify() ?? '{}').posts).toHaveLength(1);
+  });
+
+  test('閲覧できない投稿は取得できなかった件数として通知する', async () => {
+    mockApi({ ...baseResponses(), [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, isRestricted: true }] } } });
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(JSON.parse(result?.stringify() ?? '{}').posts).toHaveLength(0);
+    expect(alerts.join()).toContain('1 件の投稿');
   });
 });

@@ -1,14 +1,14 @@
 {
   "compilerOptions": {
-    "target": "es2017",
+    "target": "es2022",
     "module": "es2015",
-    "outDir": "./docs/",
     "lib": ["dom", "es2021"],
-    "removeComments": true,
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "types": ["bun"]
   },
-  "files": ["fanbox-downloader.ts"]
+  "files": ["fanbox-downloader.ts", "fanbox-downloader.test.ts"]
 }
