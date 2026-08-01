@@ -49,7 +49,7 @@ docs/
   `convertImageMap` 等は `download-helper/fanbox-collector` から import する共有ロジック
   （投稿一覧取得・ページネーションなど API 呼び出し自体はこのリポジトリ固有の実装として残る）
 - `addByPostInfo` が投稿の `publishedDatetime` を `postObject.setPublishedDatetime` で記録するため、
-  ZIP 内の各ファイルの mtime に投稿日時が反映される
+  ZIP 内の各ファイル・フォルダの mtime に投稿日時が反映される
 - FANBOX API (`api.fanbox.cc`) を fetch で呼び出し、レート制限対策に sleep を挟む
   (429 のバックオフや `Retry-After` の解釈は未実装。Issue #3 を参照)
 - 配列レスポンスは `body` 直下ではなく `body.<キー>` に入る。形状が想定と違うとき、
