@@ -247,8 +247,11 @@ function getPostInfoById(postId: string): PostInfo | undefined {
   const url = `https://api.fanbox.cc/post.info?postId=${postId}`;
   try {
     const post = DownloadManage.utils.httpGetAs<PostInfoResponse>(url)?.body?.post;
-    // 閲覧できない投稿は HTTP 4xx で返るため、形の違いは「取れなかった投稿」ではなく仕様変更とみなす。
-    // undefined に丸めると、全投稿を「支援額不足」と誤報して空の結果を出してしまう。
+    // 形の違いは「取れなかった投稿」ではなく仕様変更とみなす。undefined に丸めると、
+    // 全投稿を「支援額不足」と誤報して空の結果を出してしまう。
+    // なお閲覧できない投稿も HTTP 200 で投稿オブジェクトを返し、body プロパティは存在したまま
+    // 値が null になる (isRestricted / type / coverImageUrl は通常どおり入る)。本文の欠落は
+    // addByPostInfo が検出して投稿単位でスキップする。
     if (
       !post ||
       typeof post.id !== 'string' ||
