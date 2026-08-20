@@ -754,34 +754,34 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
 
   test('200 なら JSON を返し、待機は発行間隔のみ', async () => {
     const h = createHarness([ok('{"a":1}')]);
-    expect(await h.session.fetchJson<{ a: number }>(URL)).toEqual({ a: 1 });
+    expect(await h.session.fetchJson<{ a: number }, { a: number }>(URL, (j) => j)).toEqual({ a: 1 });
     expect(h.requested).toHaveLength(1);
     expect(h.waits).toEqual([]);
   });
 
   test('429 は 5 / 15 / 45 秒で 3 回再試行し、枯渇したら RateLimitExhaustedError', async () => {
     const h = createHarness([tooMany(), tooMany(), tooMany(), tooMany()]);
-    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(RateLimitExhaustedError);
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j)).rejects.toBeInstanceOf(RateLimitExhaustedError);
     expect(h.requested).toHaveLength(4);
     expect(h.waits.filter((w) => w >= 5_000)).toEqual([5_000, 15_000, 45_000]);
   });
 
   test('読める Retry-After は固定バックオフより優先する', async () => {
     const h = createHarness([tooMany('30'), ok('{}')]);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.waits).toContain(30_000);
     expect(h.waits).not.toContain(5_000);
   });
 
   test('Retry-After が不正なら固定バックオフへ落とす', async () => {
     const h = createHarness([tooMany('soon'), ok('{}')]);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.waits).toContain(5_000);
   });
 
   test('観測できない失敗は 5 / 15 秒の 2 回だけ再試行し、枯渇したら TransportExhaustedError', async () => {
     const h = createHarness([failure(), failure(), failure()]);
-    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(TransportExhaustedError);
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j)).rejects.toBeInstanceOf(TransportExhaustedError);
     // 429 と違い 45 秒は待たない
     expect(h.requested).toHaveLength(3);
     expect(h.waits.filter((w) => w >= 5_000)).toEqual([5_000, 15_000]);
@@ -789,38 +789,38 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
 
   test('観測できない失敗から復帰できる', async () => {
     const h = createHarness([failure(), ok('{"ok":true}')]);
-    expect(await h.session.fetchJson<{ ok: boolean }>(URL)).toEqual({ ok: true });
+    expect(await h.session.fetchJson<{ ok: boolean }, { ok: boolean }>(URL, (j) => j)).toEqual({ ok: true });
     expect(h.requested).toHaveLength(2);
   });
 
   test('2xx 以外は再試行せず HttpError になる', async () => {
     const h = createHarness([{ kind: 'response', status: 404, body: '', retryAfter: null }]);
-    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(HttpError);
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j)).rejects.toBeInstanceOf(HttpError);
     expect(h.requested).toHaveLength(1);
   });
 
   test('JSON として読めない本文は形状の問題として扱い、再試行しない', async () => {
     const h = createHarness([ok('<html>')]);
-    await expect(h.session.fetchJson(URL)).rejects.toThrow('API レスポンスの形状が想定外');
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j)).rejects.toThrow('API レスポンスの形状が想定外');
     expect(h.requested).toHaveLength(1);
   });
 
   test('exact 429 でだけ発行間隔が上がる', async () => {
     const h = createHarness([tooMany(), ok('{}')]);
     expect(h.session.intervalMs).toBe(500);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.session.intervalMs).toBe(750);
   });
 
   test('観測できない失敗では発行間隔を上げない (通信障害をレート制限として学習しない)', async () => {
     const h = createHarness([failure(), failure(), ok('{}')]);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.session.intervalMs).toBe(500);
   });
 
   test('発行間隔の引き上げには上限がある', async () => {
     const h = createHarness([tooMany(), tooMany(), tooMany(), ok('{}')], 2_000);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     // cap は max(baseInterval, 3000)
     expect(h.session.intervalMs).toBe(3_000);
   });
@@ -836,20 +836,24 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
       return { kind: 'response', status: 200, body: '{}', retryAfter: null };
     };
     const session = new ApiSession(0, transport, { sleep: async () => {}, now: () => 0 });
-    await Promise.all([session.fetchJson(URL), session.fetchJson(URL), session.fetchJson(URL)]);
+    await Promise.all([
+      session.fetchJson<unknown, unknown>(URL, (j) => j),
+      session.fetchJson<unknown, unknown>(URL, (j) => j),
+      session.fetchJson<unknown, unknown>(URL, (j) => j),
+    ]);
     expect(maxInFlight).toBe(1);
   });
 
   test('直列化は失敗した呼び出しの後も続く', async () => {
     const h = createHarness([{ kind: 'response', status: 404, body: '', retryAfter: null }, ok('{"n":2}')]);
-    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(HttpError);
-    expect(await h.session.fetchJson<{ n: number }>(URL)).toEqual({ n: 2 });
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j)).rejects.toBeInstanceOf(HttpError);
+    expect(await h.session.fetchJson<{ n: number }, { n: number }>(URL, (j) => j)).toEqual({ n: 2 });
   });
 
   test('連続する成功要求の間に発行間隔ぶんの待機が入る', async () => {
     const h = createHarness([ok('{}'), ok('{}')], 500);
-    await h.session.fetchJson(URL);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     // gate() の待機を外すとこの期待が落ちる
     expect(h.waits).toEqual([500]);
   });
@@ -862,11 +866,11 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
     results.push(ok('{}'));
     const h = createHarness(results, 500);
     // 1 回目の呼び出しが 429 と再試行の成功で 2 件消費するので、成功 19 回ぶんは 19 呼び出し
-    for (let i = 0; i < 19; i++) await h.session.fetchJson(URL);
+    for (let i = 0; i < 19; i++) await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.session.intervalMs).toBe(750);
-    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(HttpError);
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j)).rejects.toBeInstanceOf(HttpError);
     h.advance(120_000);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.session.intervalMs).toBe(750);
   });
 
@@ -875,38 +879,98 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
     // 1 回目の呼び出しで 429 → 再試行成功。以降 19 回成功して合計 20 回
     for (let i = 0; i < 20; i++) {
       h.advance(120_000);
-      await h.session.fetchJson(URL);
+      await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     }
     expect(h.session.intervalMs).toBe(600);
   });
 
   test('読めない本文は成功として数えない', async () => {
     const h = createHarness([tooMany(), ...Array(19).fill(ok('{}')), ok('<html>'), ok('{}')], 500);
-    for (let i = 0; i < 19; i++) await h.session.fetchJson(URL);
-    await expect(h.session.fetchJson(URL)).rejects.toThrow('API レスポンスの形状が想定外');
+    for (let i = 0; i < 19; i++) await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j)).rejects.toThrow('API レスポンスの形状が想定外');
     h.advance(120_000);
-    await h.session.fetchJson(URL);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.session.intervalMs).toBe(750);
   });
 
   test('待機の途中で中断できる', async () => {
+    // 待機に入ったことを確認してから中断する。同期的に abort すると直列化タスクが
+    // 始まる前に止まり、waitAbortable を外しても通ってしまう
+    let enteredSleep!: () => void;
+    const inSleep = new Promise<void>((resolve) => {
+      enteredSleep = resolve;
+    });
+    let sleepCalls = 0;
     const controller = new AbortController();
-    const transport = async (): Promise<TransportResult> => ({ kind: 'unobservable-failure' });
-    const session = new ApiSession(0, transport, {
-      // 待機は解決しない。abort でのみ抜けられることを確かめる
-      sleep: () => new Promise<void>(() => {}),
+    const session = new ApiSession(0, async (): Promise<TransportResult> => ({ kind: 'unobservable-failure' }), {
+      sleep: () => {
+        sleepCalls++;
+        enteredSleep();
+        // 解決しない。abort でのみ抜けられることを確かめる
+        return new Promise<void>(() => {});
+      },
       now: () => 0,
     });
-    const pending = session.fetchJson(URL, controller.signal);
+    const pending = session.fetchJson<unknown, unknown>(URL, (j) => j, controller.signal);
+    await inSleep;
     controller.abort();
     await expect(pending).rejects.toBeDefined();
+    expect(sleepCalls).toBe(1);
+  });
+
+  test('発行中に中断したら、応答が返っても成功として扱わない', async () => {
+    let enteredTransport!: () => void;
+    const inTransport = new Promise<void>((resolve) => {
+      enteredTransport = resolve;
+    });
+    let release!: (result: TransportResult) => void;
+    let calls = 0;
+    const controller = new AbortController();
+    const session = new ApiSession(
+      0,
+      () => {
+        calls++;
+        enteredTransport();
+        return new Promise<TransportResult>((resolve) => {
+          release = resolve;
+        });
+      },
+      { sleep: async () => {}, now: () => 0 },
+    );
+    const pending = session.fetchJson<unknown, unknown>(URL, (j) => j, controller.signal);
+    await inTransport;
+    controller.abort();
+    release({ kind: 'response', status: 200, body: '{}', retryAfter: null });
+    await expect(pending).rejects.toBeDefined();
+    // 中断後に追加の要求を出さない
+    expect(calls).toBe(1);
+  });
+
+  test('成功が 20 回続いても静穏期間が満たなければ減衰しない', async () => {
+    const h = createHarness([tooMany(), ...Array(20).fill(ok('{}'))], 500);
+    for (let i = 0; i < 20; i++) await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    // 時計は待機ぶんしか進んでおらず、最後のレート制限から 60 秒経っていない
+    expect(h.session.intervalMs).toBe(750);
+  });
+
+  test('形状検証に失敗した応答は成功として数えない', async () => {
+    const h = createHarness([tooMany(), ...Array(19).fill(ok('{}')), ok('{}'), ok('{}')], 500);
+    for (let i = 0; i < 19; i++) await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await expect(
+      h.session.fetchJson<unknown, unknown>(URL, () => {
+        throw new Error('形状が想定外');
+      }),
+    ).rejects.toThrow('形状が想定外');
+    h.advance(120_000);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    expect(h.session.intervalMs).toBe(750);
   });
 
   test('中断済みの signal では要求を出さない', async () => {
     const h = createHarness([ok('{}')]);
     const controller = new AbortController();
     controller.abort();
-    await expect(h.session.fetchJson(URL, controller.signal)).rejects.toBeDefined();
+    await expect(h.session.fetchJson<unknown, unknown>(URL, (j) => j, controller.signal)).rejects.toBeDefined();
     expect(h.requested).toHaveLength(0);
   });
 });

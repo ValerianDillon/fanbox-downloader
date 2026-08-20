@@ -122,8 +122,8 @@ function applyAddResult(result: AddPostResult, counts: FailureCounts): boolean {
           counts.restricted++;
           return false;
         case 'missing-body':
-          // missing-body には通信失敗や CORS も合流する (getPostInfoById がそれらを undefined
-          // に丸め、addByPostInfo は理由を区別できないため)
+          // 本文が無かった投稿と、詳細取得が HTTP エラーだった投稿が合流する。
+          // 通信の失敗と CORS は再試行を経て枯渇として伝播するので、ここには来ない
           counts.missingBody++;
           return false;
         default: {
@@ -204,7 +204,7 @@ export type TransportFailure = { kind: 'unobservable-failure'; cause?: unknown }
 
 export type TransportResult = TransportResponse | TransportFailure;
 
-export type Transport = (url: string) => Promise<TransportResult>;
+export type Transport = (url: string, signal?: AbortSignal) => Promise<TransportResult>;
 
 /**
  * ページ origin から同期 XHR で取得する transport。
@@ -212,7 +212,8 @@ export type Transport = (url: string) => Promise<TransportResult>;
  * それでも読みに行くのは、サーバが Access-Control-Expose-Headers を返すようになれば
  * 実装を変えずに使えるようにするため。
  */
-export const pageOriginTransport: Transport = async (url) => {
+export const pageOriginTransport: Transport = async (url, _signal) => {
+  // 同期 XHR は発行後に中断できない。中断の検出はセッション側が発行の前後で行う
   const xhr = new XMLHttpRequest();
   try {
     xhr.open('GET', url, false);
@@ -363,21 +364,32 @@ export class ApiSession {
     return this.interval;
   }
 
-  async fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  /**
+   * 取得して JSON として読み、validate に通す。
+   * 検証まで通ったものだけを成功として数える。エンドポイント固有の形状検証をセッションの外に
+   * 置くと、握りつぶされた不正応答が連続成功数に残り、減衰の条件が「有効な成功が継続」で
+   * なくなる。
+   */
+  async fetchJson<T, R>(url: string, validate: (parsed: T) => R, signal?: AbortSignal): Promise<R> {
     return this.serialize(async () => {
       const body = await this.request(url, signal);
       let parsed: T;
       try {
         parsed = JSON.parse(body) as T;
       } catch {
-        // 形状の問題は通信の問題ではないので再試行しない。
-        // ここまで来た応答は成功として数えない (減衰の条件は「API 成功が継続」であり、
-        // 読めない本文を成功に数えると連続性の意味が崩れる)
+        // 形状の問題は通信の問題ではないので再試行しない
         this.onFailure();
         throw new ApiShapeError(url);
       }
+      let validated: R;
+      try {
+        validated = validate(parsed);
+      } catch (e) {
+        this.onFailure();
+        throw e;
+      }
       this.onSuccess();
-      return parsed;
+      return validated;
     });
   }
 
@@ -399,7 +411,9 @@ export class ApiSession {
       throwIfAborted(signal);
       await this.gate(signal);
       throwIfAborted(signal);
-      const result = await this.transport(url);
+      const result = await this.transport(url, signal);
+      // 発行中に中断された場合、応答が返っていても成功として数えない
+      throwIfAborted(signal);
       if (result.kind === 'unobservable-failure') {
         // 観測できない失敗では間隔を上げない。通信障害をレート制限として学習しないため
         this.onFailure();
@@ -522,10 +536,8 @@ export async function searchBy(
   let plans: PlanInfo[] = [];
   try {
     // プラン名は支援額タグの表示名に使うだけなので、失敗しても収集は続ける
-    plans = unwrapArray<PlanInfo>(
-      (await session.fetchJson<PlansResponse>(planUrl))?.body?.plans,
-      planUrl,
-      (item) => typeof (item as PlanInfo | null)?.fee === 'number',
+    plans = await session.fetchJson<PlansResponse, PlanInfo[]>(planUrl, (json) =>
+      unwrapArray<PlanInfo>(json?.body?.plans, planUrl, (item) => typeof (item as PlanInfo | null)?.fee === 'number'),
     );
   } catch (e) {
     // 枯渇だけは握りつぶさない。既に上限まで待った直後に別のエンドポイントへ要求を出すのは、
@@ -549,11 +561,13 @@ export async function searchBy(
   downloadSettings.downloadObject.setUrl(`https://www.fanbox.cc/@${creatorId}`);
   const tagUrl = `https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`;
   try {
-    const definedTags = unwrapArray<{ tag: string }>(
-      (await session.fetchJson<TagsResponse>(tagUrl))?.body?.featuredTags,
-      tagUrl,
-      (item) => typeof (item as { tag?: unknown } | null)?.tag === 'string',
-    ).map((tag) => tag.tag);
+    const definedTags = await session.fetchJson<TagsResponse, string[]>(tagUrl, (json) =>
+      unwrapArray<{ tag: string }>(
+        json?.body?.featuredTags,
+        tagUrl,
+        (item) => typeof (item as { tag?: unknown } | null)?.tag === 'string',
+      ).map((tag) => tag.tag),
+    );
     downloadSettings.addTags(...definedTags);
   } catch (e) {
     const reason = exhaustionReason(e);
@@ -611,10 +625,8 @@ async function getItemsById(session: ApiSession, downloadManage: DownloadManage)
   const paginateUrl = `https://api.fanbox.cc/post.paginateCreator?creatorId=${downloadManage.userId}`;
   let urls: string[];
   try {
-    urls = unwrapArray<string>(
-      (await session.fetchJson<PostPaginationResponse>(paginateUrl))?.body?.pageUrls,
-      paginateUrl,
-      (item) => typeof item === 'string',
+    urls = await session.fetchJson<PostPaginationResponse, string[]>(paginateUrl, (json) =>
+      unwrapArray<string>(json?.body?.pageUrls, paginateUrl, (item) => typeof item === 'string'),
     );
   } catch (e) {
     // 形状の不一致はページ取得の失敗ではなく仕様変更なので、他の経路と同じ文言で中止する
@@ -672,16 +684,18 @@ async function fetchPostList(
   failures: FailureCounts,
 ): Promise<PostListItem[] | undefined> {
   try {
-    return unwrapArray<PostListItem>((await session.fetchJson<PostListResponse>(url))?.body?.posts, url, (item) => {
-      const post = item as PostListItem | null;
-      // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
-      return (
-        !!post &&
-        typeof post.id === 'string' &&
-        typeof post.isRestricted === 'boolean' &&
-        typeof post.feeRequired === 'number'
-      );
-    });
+    return await session.fetchJson<PostListResponse, PostListItem[]>(url, (json) =>
+      unwrapArray<PostListItem>(json?.body?.posts, url, (item) => {
+        const post = item as PostListItem | null;
+        // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
+        return (
+          !!post &&
+          typeof post.id === 'string' &&
+          typeof post.isRestricted === 'boolean' &&
+          typeof post.feeRequired === 'number'
+        );
+      }),
+    );
   } catch (e) {
     // ページ単位の失敗として数えてよいのは HTTP エラーだけ。枯渇はこのページだけの
     // 失敗ではなく、想定外の例外は実装上のバグでありうるので、どちらも呼び出し側へ渡す。
@@ -736,21 +750,23 @@ async function addPostList(
 async function getPostInfoById(session: ApiSession, postId: string): Promise<PostInfo | undefined> {
   const url = `https://api.fanbox.cc/post.info?postId=${postId}`;
   try {
-    const post = (await session.fetchJson<PostInfoResponse>(url))?.body?.post;
-    // 形の違いは「取れなかった投稿」ではなく仕様変更とみなす。undefined に丸めると、
-    // 全投稿を「支援額不足」と誤報して空の結果を出してしまう。
-    // なお閲覧できない投稿も HTTP 200 で投稿オブジェクトを返し、body プロパティは存在したまま
-    // 値が null になる (isRestricted / type / coverImageUrl は通常どおり入る)。本文の欠落は
-    // addByPostInfo が検出して投稿単位でスキップする。
-    if (
-      !post ||
-      typeof post.id !== 'string' ||
-      typeof post.type !== 'string' ||
-      typeof post.isRestricted !== 'boolean'
-    ) {
-      throw new ApiShapeError(url);
-    }
-    return post;
+    return await session.fetchJson<PostInfoResponse, PostInfo>(url, (json) => {
+      const post = json?.body?.post;
+      // 形の違いは「取れなかった投稿」ではなく仕様変更とみなす。undefined に丸めると、
+      // 全投稿を「支援額不足」と誤報して空の結果を出してしまう。
+      // なお閲覧できない投稿も HTTP 200 で投稿オブジェクトを返し、body プロパティは存在したまま
+      // 値が null になる (isRestricted / type / coverImageUrl は通常どおり入る)。本文の欠落は
+      // addByPostInfo が検出して投稿単位でスキップする。
+      if (
+        !post ||
+        typeof post.id !== 'string' ||
+        typeof post.type !== 'string' ||
+        typeof post.isRestricted !== 'boolean'
+      ) {
+        throw new ApiShapeError(url);
+      }
+      return post;
+    });
   } catch (e) {
     // 投稿単位の失敗として数えてよいのは HTTP エラーだけ。形状の不一致と枯渇はこの投稿だけの
     // 問題ではなく、想定外の例外は実装上のバグでありうるので、どちらも呼び出し側へ渡す

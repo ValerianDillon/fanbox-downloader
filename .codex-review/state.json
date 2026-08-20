@@ -1,0 +1,75 @@
+{
+  "target": "git diff master -- .",
+  "model": "gpt-5.6-sol",
+  "effort": "high",
+  "round": 1,
+  "last_clean_review_round": 1,
+  "resume_at": null,
+  "blocked_reason": null,
+  "open_findings": [
+    {
+      "id": "r1-1",
+      "severity": "major",
+      "summary": "適応スロットルの連続成功が失敗で途切れず、成功判定が JSON パース前",
+      "status": "fixed_unverified"
+    },
+    {
+      "id": "r1-2",
+      "severity": "major",
+      "summary": "plan/tag/paginate が想定外の例外を通常の取得失敗に丸める",
+      "status": "fixed_unverified"
+    },
+    {
+      "id": "r1-3",
+      "severity": "major",
+      "summary": "再試行・ゲート待機が abort 可能でない",
+      "status": "fixed_unverified"
+    },
+    {
+      "id": "r1-4",
+      "severity": "minor",
+      "summary": "Retry-After の秒数判定が HTTP 構文より広い",
+      "status": "fixed_unverified"
+    },
+    {
+      "id": "r1-5",
+      "severity": "minor",
+      "summary": "枯渇通知に停止位置と取り込み件数が無い",
+      "status": "fixed_unverified"
+    },
+    {
+      "id": "r1-6",
+      "severity": "minor",
+      "summary": "ゲート間隔と pageOriginTransport がテストで固定されていない",
+      "status": "fixed_unverified"
+    }
+  ],
+  "unverified_changes_since_last_clean_review": [
+    {
+      "change": "onFailure による連続成功のリセットと、パース後の成功計上",
+      "originating_round": 1,
+      "originating_finding": "r1-1"
+    },
+    {
+      "change": "plan/tag/paginate の catch を HttpError / ApiShapeError に限定",
+      "originating_round": 1,
+      "originating_finding": "r1-2"
+    },
+    { "change": "waitAbortable による待機の中断", "originating_round": 1, "originating_finding": "r1-3" },
+    {
+      "change": "delay-seconds を数字のみに、HTTP-date は英字を含む場合のみ",
+      "originating_round": 1,
+      "originating_finding": "r1-4"
+    },
+    {
+      "change": "StoppedInfo による取り込み件数と停止ページの通知",
+      "originating_round": 1,
+      "originating_finding": "r1-5"
+    },
+    {
+      "change": "ゲート間隔・減衰条件・pageOriginTransport のテスト追加",
+      "originating_round": 1,
+      "originating_finding": "r1-6"
+    }
+  ]
+}
