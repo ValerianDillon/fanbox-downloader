@@ -174,33 +174,54 @@ describe('buildFailureMessage', () => {
   });
 
   test('閲覧制限だけなら見出しを付けずに 1 行で伝える', () => {
-    const message = buildFailureMessage(counts({ restricted: 3 }));
-    expect(message).toBe('閲覧制限により取得できなかった投稿: 3 件');
-    expect(message).not.toContain('確認が必要な未取得');
+    expect(buildFailureMessage(counts({ restricted: 3 }))).toBe('閲覧制限により取得できなかった投稿: 3 件');
   });
 
   test('確認が必要な区分だけなら閲覧条件の節を出さない', () => {
-    const message = buildFailureMessage(counts({ missingBody: 2 })) ?? '';
-    expect(message).toContain('確認が必要な未取得');
-    expect(message).toContain('2 件');
-    expect(message).not.toContain('閲覧条件による未取得');
+    expect(buildFailureMessage(counts({ missingBody: 2 }))).toBe(
+      [
+        '一部の投稿を取得できませんでした。',
+        '',
+        '確認が必要な未取得:',
+        '- 投稿詳細を取得できないか、本文を利用できなかった投稿: 2 件',
+      ].join('\n'),
+    );
   });
 
-  test('併存するとき確認が必要な区分を先に出す', () => {
-    const message = buildFailureMessage(counts({ restricted: 35, missingBody: 10 })) ?? '';
-    expect(message.indexOf('確認が必要な未取得')).toBeLessThan(message.indexOf('閲覧条件による未取得'));
+  test('未対応の投稿形式だけなら他の区分を出さない', () => {
+    expect(buildFailureMessage(counts({ unsupported: 1 }))).toBe(
+      ['一部の投稿を取得できませんでした。', '', '確認が必要な未取得:', '- 未対応の投稿形式: 1 件'].join('\n'),
+    );
   });
 
-  test('ページ単位の失敗は件数と合算せずページ単位で出す', () => {
-    const message = buildFailureMessage(counts({ restricted: 1, pages: 1 })) ?? '';
-    expect(message).toContain('1 ページ');
-    expect(message).not.toContain('2 件');
+  test('一覧ページの失敗だけならページ単位で出す', () => {
+    expect(buildFailureMessage(counts({ pages: 1 }))).toBe(
+      [
+        '一部の投稿を取得できませんでした。',
+        '',
+        '確認が必要な未取得:',
+        '- 取得できなかった投稿一覧: 1 ページ (欠落した投稿数は不明)',
+      ].join('\n'),
+    );
   });
 
-  test('原因を推測しない', () => {
-    const message = buildFailureMessage(counts({ missingBody: 5, unsupported: 1, pages: 1 })) ?? '';
-    expect(message).not.toContain('レート制限');
-    expect(message).not.toContain('支援プラン');
+  // 全区分の完全一致で、件数・順序・余分な区分・原因を推測する文言の混入をまとめて固定する
+  // (原因を書かないのは、missing-body に CORS・通信断・API 障害・レート制限・仕様変更・
+  // 実際の本文欠落が合流しており、件数からは識別できないため)
+  test('全区分が併存するとき、確認が必要な区分を先に置いて原因は書かない', () => {
+    expect(buildFailureMessage(counts({ restricted: 35, missingBody: 10, unsupported: 2, pages: 1 }))).toBe(
+      [
+        '一部の投稿を取得できませんでした。',
+        '',
+        '確認が必要な未取得:',
+        '- 投稿詳細を取得できないか、本文を利用できなかった投稿: 10 件',
+        '- 未対応の投稿形式: 2 件',
+        '- 取得できなかった投稿一覧: 1 ページ (欠落した投稿数は不明)',
+        '',
+        '閲覧条件による未取得:',
+        '- 閲覧制限のある投稿: 35 件',
+      ].join('\n'),
+    );
   });
 });
 
@@ -337,6 +358,21 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     expect(requested).not.toContain(POST_INFO_URL);
     expect(requested).toContain(postInfoUrl('1002'));
     // 意図的な除外は失敗ではない
+    expect(alerts).toEqual([]);
+  });
+
+  test('無料を省く設定では、閲覧制限のある無料投稿も失敗に数えない', async () => {
+    // isIgnoreFree を isRestricted より先に判定する契約。逆順にすると閲覧制限として数えてしまう
+    mockApi(
+      {
+        ...baseResponses(),
+        [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { isRestricted: true })] } },
+      },
+      { ignoreFree: true },
+    );
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(postCount(result)).toBe(0);
+    expect(requested).not.toContain(POST_INFO_URL);
     expect(alerts).toEqual([]);
   });
 
