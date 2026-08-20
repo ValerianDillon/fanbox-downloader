@@ -11,7 +11,7 @@ import {
   type ImageInfo,
   type UrlEmbedInfo,
 } from 'download-helper/fanbox-collector';
-import { searchBy } from './fanbox-downloader';
+import { buildFailureMessage, searchBy } from './fanbox-downloader';
 
 // convert*Map / DownloadManage の実装本体は download-helper/fanbox-collector.ts に移設済み
 // (詳細なテストは download-helper リポジトリの fanbox-collector.test.ts を参照)。
@@ -160,12 +160,64 @@ describe('DownloadManage', () => {
   });
 });
 
-describe('searchBy - API レスポンスのアンラップ', () => {
+describe('buildFailureMessage', () => {
+  const counts = (over: Partial<Record<'restricted' | 'missingBody' | 'unsupported' | 'pages', number>> = {}) => ({
+    restricted: 0,
+    missingBody: 0,
+    unsupported: 0,
+    pages: 0,
+    ...over,
+  });
+
+  test('失敗が無ければ通知しない', () => {
+    expect(buildFailureMessage(counts())).toBeUndefined();
+  });
+
+  test('閲覧制限だけなら見出しを付けずに 1 行で伝える', () => {
+    const message = buildFailureMessage(counts({ restricted: 3 }));
+    expect(message).toBe('閲覧制限により取得できなかった投稿: 3 件');
+    expect(message).not.toContain('確認が必要な未取得');
+  });
+
+  test('確認が必要な区分だけなら閲覧条件の節を出さない', () => {
+    const message = buildFailureMessage(counts({ missingBody: 2 })) ?? '';
+    expect(message).toContain('確認が必要な未取得');
+    expect(message).toContain('2 件');
+    expect(message).not.toContain('閲覧条件による未取得');
+  });
+
+  test('併存するとき確認が必要な区分を先に出す', () => {
+    const message = buildFailureMessage(counts({ restricted: 35, missingBody: 10 })) ?? '';
+    expect(message.indexOf('確認が必要な未取得')).toBeLessThan(message.indexOf('閲覧条件による未取得'));
+  });
+
+  test('ページ単位の失敗は件数と合算せずページ単位で出す', () => {
+    const message = buildFailureMessage(counts({ restricted: 1, pages: 1 })) ?? '';
+    expect(message).toContain('1 ページ');
+    expect(message).not.toContain('2 件');
+  });
+
+  test('原因を推測しない', () => {
+    const message = buildFailureMessage(counts({ missingBody: 5, unsupported: 1, pages: 1 })) ?? '';
+    expect(message).not.toContain('レート制限');
+    expect(message).not.toContain('支援プラン');
+  });
+});
+
+describe('searchBy - API レスポンスのアンラップと失敗の集計', () => {
   const CREATOR_ID = 'testcreator';
   const LIST_PAGE_URL = 'https://api.fanbox.cc/post.listCreator?creatorId=testcreator&cursor=1';
-  const POST_INFO_URL = 'https://api.fanbox.cc/post.info?postId=1001';
+  const LIST_PAGE_URL_2 = 'https://api.fanbox.cc/post.listCreator?creatorId=testcreator&cursor=2';
+  const postInfoUrl = (postId: string) => `https://api.fanbox.cc/post.info?postId=${postId}`;
+  const POST_INFO_URL = postInfoUrl('1001');
 
-  const POST_STUB = { id: '1001', isRestricted: false, feeRequired: 0 };
+  const listItem = (postId: string, over: Record<string, unknown> = {}) => ({
+    id: postId,
+    isRestricted: false,
+    feeRequired: 0,
+    ...over,
+  });
+  const POST_STUB = listItem('1001');
   const POST_FULL = {
     id: '1001',
     title: 'リンゴ',
@@ -182,6 +234,7 @@ describe('searchBy - API レスポンスのアンラップ', () => {
     type: 'text',
     body: { text: 'hello' },
   };
+  const fullPost = (postId: string, over: Record<string, unknown> = {}) => ({ ...POST_FULL, id: postId, ...over });
 
   /** 一覧までは正常形状で返す共通のモック定義 */
   const baseResponses = (): Record<string, unknown> => ({
@@ -202,19 +255,27 @@ describe('searchBy - API レスポンスのアンラップ', () => {
     prompt: g.prompt,
   };
   let alerts: string[];
+  /** 実際に発行された URL。「叩かないこと」を欠落ではなく記録で確かめるために持つ */
+  let requested: string[];
 
-  function mockApi(responses: Record<string, unknown>) {
+  function mockApi(responses: Record<string, unknown>, options: { ignoreFree?: boolean } = {}) {
     alerts = [];
+    requested = [];
     DownloadManage.utils.httpGetAs = ((url: string) => {
+      requested.push(url);
       if (!(url in responses)) throw new Error(`HTTP 404: ${url}`);
       return responses[url];
     }) as typeof DownloadManage.utils.httpGetAs;
     // レート制限の待機はテストでは不要
     DownloadManage.utils.sleep = (() => Promise.resolve()) as typeof DownloadManage.utils.sleep;
     g.alert = (message: string) => alerts.push(message);
-    g.confirm = () => false;
+    // 「無料コンテンツを省く？」への回答
+    g.confirm = () => options.ignoreFree === true;
     g.prompt = () => null;
   }
+
+  const postCount = (result: { stringify(): string } | undefined) =>
+    JSON.parse(result?.stringify() ?? '{}').posts.length;
 
   afterEach(() => {
     DownloadManage.utils.httpGetAs = orig.httpGetAs;
@@ -228,7 +289,7 @@ describe('searchBy - API レスポンスのアンラップ', () => {
     mockApi(baseResponses());
     const result = await searchBy(CREATOR_ID, undefined);
     expect(result).toBeDefined();
-    expect(JSON.parse(result?.stringify() ?? '{}').posts).toHaveLength(1);
+    expect(postCount(result)).toBe(1);
     expect(alerts).toEqual([]);
   });
 
@@ -250,13 +311,112 @@ describe('searchBy - API レスポンスのアンラップ', () => {
       [`https://api.fanbox.cc/tag.getFeatured?creatorId=${CREATOR_ID}`]: { body: [{ tag: 'x' }] },
     });
     const result = await searchBy(CREATOR_ID, undefined);
-    expect(JSON.parse(result?.stringify() ?? '{}').posts).toHaveLength(1);
+    expect(postCount(result)).toBe(1);
   });
 
-  test('閲覧できない投稿は取得できなかった件数として通知する', async () => {
-    mockApi({ ...baseResponses(), [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, isRestricted: true }] } } });
+  test('閲覧できない投稿は post.info を叩かず閲覧制限として数える', async () => {
+    mockApi({ ...baseResponses(), [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { isRestricted: true })] } } });
     const result = await searchBy(CREATOR_ID, undefined);
-    expect(JSON.parse(result?.stringify() ?? '{}').posts).toHaveLength(0);
-    expect(alerts.join()).toContain('1 件の投稿');
+    expect(postCount(result)).toBe(0);
+    expect(requested).not.toContain(POST_INFO_URL);
+    expect(alerts.join()).toContain('閲覧制限により取得できなかった投稿: 1 件');
+  });
+
+  test('無料を省く設定のとき、無料投稿は post.info を叩かず失敗にも数えない', async () => {
+    mockApi(
+      {
+        ...baseResponses(),
+        [LIST_PAGE_URL]: { body: { posts: [listItem('1001'), listItem('1002', { feeRequired: 500 })] } },
+        [postInfoUrl('1002')]: { body: { post: fullPost('1002', { feeRequired: 500 }) } },
+      },
+      { ignoreFree: true },
+    );
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(postCount(result)).toBe(1);
+    expect(requested).not.toContain(POST_INFO_URL);
+    expect(requested).toContain(postInfoUrl('1002'));
+    // 意図的な除外は失敗ではない
+    expect(alerts).toEqual([]);
+  });
+
+  test('post.info の呼び出しが失敗した投稿は本文を利用できなかったものとして数える', async () => {
+    const responses = baseResponses();
+    delete responses[POST_INFO_URL];
+    mockApi(responses);
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(postCount(result)).toBe(0);
+    expect(alerts.join()).toContain('投稿詳細を取得できないか、本文を利用できなかった投稿: 1 件');
+  });
+
+  test('post.info は成功しても本文が無い投稿は本文を利用できなかったものとして数える', async () => {
+    mockApi({ ...baseResponses(), [POST_INFO_URL]: { body: { post: { ...POST_FULL, body: null } } } });
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(postCount(result)).toBe(0);
+    expect(alerts.join()).toContain('投稿詳細を取得できないか、本文を利用できなかった投稿: 1 件');
+  });
+
+  test('未知の投稿タイプは未対応として数える', async () => {
+    mockApi({
+      ...baseResponses(),
+      [POST_INFO_URL]: { body: { post: { ...POST_FULL, type: 'image-v2', body: { text: 'x' } } } },
+    });
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(postCount(result)).toBe(0);
+    expect(alerts.join()).toContain('未対応の投稿形式: 1 件');
+  });
+
+  test('本文の必須フィールドが欠けた投稿があると即座に中断し、部分結果を返さない', async () => {
+    mockApi({
+      ...baseResponses(),
+      [LIST_PAGE_URL]: { body: { posts: [listItem('1001'), listItem('1002'), listItem('1003')] } },
+      // 既知タイプなのに body.text が string でない = 構造的な不一致
+      [postInfoUrl('1002')]: { body: { post: fullPost('1002', { body: { text: 123 } }) } },
+      [postInfoUrl('1003')]: { body: { post: fullPost('1003') } },
+    });
+    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    // 中断後の投稿は取得しない
+    expect(requested).not.toContain(postInfoUrl('1003'));
+    // ページ単位の失敗に丸めない
+    expect(alerts.join()).not.toContain('ページ');
+    expect(alerts.join()).toContain('仕様が変わった可能性');
+  });
+
+  test('単一投稿モードでも本文の必須フィールド欠落で結果を返さない', async () => {
+    mockApi({ ...baseResponses(), [POST_INFO_URL]: { body: { post: { ...POST_FULL, body: { text: 123 } } } } });
+    expect(await searchBy(CREATOR_ID, '1001')).toBeUndefined();
+    expect(alerts.join()).toContain('仕様が変わった可能性');
+  });
+
+  test('単一投稿モードでも post.info が旧形状なら結果を返さない', async () => {
+    mockApi({ ...baseResponses(), [POST_INFO_URL]: { body: POST_FULL } });
+    expect(await searchBy(CREATOR_ID, '1001')).toBeUndefined();
+    expect(alerts.join()).toContain('仕様が変わった可能性');
+  });
+
+  test('閲覧制限と一覧ページの失敗は合算しない', async () => {
+    mockApi({
+      ...baseResponses(),
+      [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: {
+        body: { pageUrls: [LIST_PAGE_URL, LIST_PAGE_URL_2] },
+      },
+      [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { isRestricted: true })] } },
+      // LIST_PAGE_URL_2 は未定義なので取得に失敗する
+    });
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(result).toBeDefined();
+    const message = alerts.join();
+    expect(message).toContain('閲覧制限のある投稿: 1 件');
+    expect(message).toContain('1 ページ');
+    expect(message).not.toContain('2 件');
+  });
+
+  test('feeRequired が number でない一覧要素は形状の不一致として中断する', async () => {
+    mockApi({
+      ...baseResponses(),
+      [LIST_PAGE_URL]: { body: { posts: [{ id: '1001', isRestricted: false, feeRequired: '0' }] } },
+    });
+    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    expect(requested).not.toContain(POST_INFO_URL);
+    expect(alerts.join()).toContain('仕様が変わった可能性');
   });
 });

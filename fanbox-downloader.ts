@@ -18,16 +18,25 @@ import {
 const API_RATE_LIMIT_MS = 500;
 
 /**
- * 取得できなかった件数。
+ * 取得できなかった件数の内訳。
  * addByPostInfo は取れなかった投稿を黙って読み飛ばすので、数えずに任せると
  * 本文の在り処が変わって全投稿が消えても気付けない。
- * ページ単位の失敗は欠落した投稿数が不明なので、投稿単位とは足し合わせない。
+ * 理由ごとに利用者が取るべき対応が違うため 1 個の数値に合算しない。
+ * とくにページ単位の失敗は欠落した投稿数が不明なので、投稿単位とは足し合わせられない。
  */
-type FailureCounts = { posts: number; pages: number };
+type FailureCounts = {
+  /** 閲覧できないため本文を取り込めなかった投稿。支援プランの範囲外など正常系でも起こる */
+  restricted: number;
+  /** 投稿詳細を取得できないか、取得できても本文が無かった投稿 */
+  missingBody: number;
+  /** 未知の投稿タイプで取り込めなかった投稿 */
+  unsupported: number;
+  /** 取得できなかった投稿一覧ページ */
+  pages: number;
+};
 
-/** isIgnoreFree による意図的な除外は数えない。取れなかった投稿だけを数える */
-function isFailure(result: AddPostResult): boolean {
-  return result === 'unavailable' || result === 'invalid';
+function emptyFailureCounts(): FailureCounts {
+  return { restricted: 0, missingBody: 0, unsupported: 0, pages: 0 };
 }
 
 /**
@@ -40,6 +49,83 @@ class ApiShapeError extends Error {
     super(`API レスポンスの形状が想定外: ${url}`);
     this.name = 'ApiShapeError';
   }
+}
+
+/**
+ * 既知の投稿タイプなのに addByPostInfo が実際に読むフィールドが欠けていた。
+ * 検出層が ApiShapeError (API ラッパーの形状) と違うので型を分けるが、
+ * 「このバージョンでは仕様変更に追随できていない」という意味は同じなので中断の扱いは揃える。
+ * ApiShapeError を継承しない: instanceof で検出層の違いが潰れるうえ、URL を受け取る
+ * コンストラクタの契約に合わない。
+ */
+class PostBodyInvalidError extends Error {
+  constructor(postId: string, type: string, missing: readonly string[]) {
+    super(`投稿本文の形状が想定外 (postId: ${postId}, type: ${type}, missing: ${missing.join(', ')})`);
+    this.name = 'PostBodyInvalidError';
+  }
+}
+
+const ABORT_MESSAGE = 'FANBOX API の仕様が変わった可能性があります。取得を中止しました';
+
+/** 投稿単位の失敗に丸めず、結果自体を返さずに中断すべきエラーか */
+function isCollectionAbortError(error: unknown): error is ApiShapeError | PostBodyInvalidError {
+  return error instanceof ApiShapeError || error instanceof PostBodyInvalidError;
+}
+
+/**
+ * addByPostInfo の結果を counts に反映する。
+ * invalid だけは投稿単位の失敗に数えず投げる: 既知の投稿タイプなのに読むべきフィールドが
+ * 欠けている構造的な不一致であり、支援額不足のような正常系では説明できない。数えて続行すると
+ * 仕様変更に気付かないまま中身の欠けた結果を成功として出してしまう。
+ */
+function applyAddResult(result: AddPostResult, counts: FailureCounts): void {
+  switch (result.status) {
+    case 'added':
+    case 'ignored':
+      return;
+    case 'unavailable':
+      // missing-body には通信失敗や CORS も合流する (getPostInfoById がそれらを undefined に
+      // 丸め、addByPostInfo は理由を区別できないため)
+      if (result.reason === 'restricted') counts.restricted++;
+      else counts.missingBody++;
+      return;
+    case 'unsupported':
+      counts.unsupported++;
+      return;
+    case 'invalid':
+      throw new PostBodyInvalidError(result.postId, result.type, result.missing);
+    default: {
+      // status が増えたときに型検査で気付けるようにする
+      const exhaustive: never = result;
+      throw new Error(`未知の AddPostResult: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * 失敗件数から alert の文面を組み立てる。失敗が無ければ undefined を返す。
+ * 原因は推測しない: missing-body には CORS・通信断・API 障害・レート制限・仕様変更・実際の
+ * 本文欠落が合流しており、件数の比率からは識別できないため、断定すると誤誘導になる。
+ * 確認が必要な区分を先に置き、正常系でも大量に出る restricted に埋もれないようにする。
+ */
+export function buildFailureMessage(failures: FailureCounts): string | undefined {
+  const needsAttention = [
+    failures.missingBody > 0
+      ? `- 投稿詳細を取得できないか、本文を利用できなかった投稿: ${failures.missingBody} 件`
+      : '',
+    failures.unsupported > 0 ? `- 未対応の投稿形式: ${failures.unsupported} 件` : '',
+    failures.pages > 0 ? `- 取得できなかった投稿一覧: ${failures.pages} ページ (欠落した投稿数は不明)` : '',
+  ].filter(Boolean);
+  if (needsAttention.length === 0) {
+    if (failures.restricted === 0) return undefined;
+    // 閲覧制限だけなら異常ではないので、見出しを付けずに 1 行で伝える
+    return `閲覧制限により取得できなかった投稿: ${failures.restricted} 件`;
+  }
+  const sections = [`確認が必要な未取得:\n${needsAttention.join('\n')}`];
+  if (failures.restricted > 0) {
+    sections.push(`閲覧条件による未取得:\n- 閲覧制限のある投稿: ${failures.restricted} 件`);
+  }
+  return `一部の投稿を取得できませんでした。\n\n${sections.join('\n\n')}`;
 }
 
 function unwrapArray<T>(value: unknown, url: string, isValidItem?: (item: unknown) => boolean): T[] {
@@ -141,7 +227,16 @@ export async function searchBy(
   }
   let failures: FailureCounts;
   if (postId) {
-    failures = { posts: isFailure(addByPostInfo(downloadSettings, getPostInfoById(postId))) ? 1 : 0, pages: 0 };
+    failures = emptyFailureCounts();
+    try {
+      applyAddResult(addByPostInfo(downloadSettings, getPostInfoById(postId)), failures);
+    } catch (e) {
+      // 一覧モードと同じく、形状の不一致は投稿単位の失敗に丸めず結果自体を返さない
+      if (!isCollectionAbortError(e)) throw e;
+      console.error('投稿の形状が想定外:', e);
+      alert(ABORT_MESSAGE);
+      return;
+    }
   } else {
     const collected = await getItemsById(downloadSettings);
     // 形状エラーで中止したときは、途中までの結果を成功として出さない
@@ -149,13 +244,8 @@ export async function searchBy(
     failures = collected;
   }
   downloadSettings.applyTags();
-  const messages = [
-    failures.posts > 0 ? `${failures.posts} 件の投稿` : '',
-    failures.pages > 0 ? `${failures.pages} ページ分の投稿一覧 (投稿数は不明)` : '',
-  ].filter(Boolean);
-  if (messages.length) {
-    alert(`${messages.join(' と ')}を取得できませんでした (支援プランの範囲外か、レート制限の可能性があります)`);
-  }
+  const message = buildFailureMessage(failures);
+  if (message) alert(message);
   return downloadSettings.downloadObject;
 }
 
@@ -186,17 +276,17 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
     alert('投稿一覧の取得に失敗しました');
     return undefined;
   }
-  const failures: FailureCounts = { posts: 0, pages: 0 };
+  const failures = emptyFailureCounts();
   for (let i = 0; i < urls.length; i++) {
     console.log(`${i + 1}回目`);
     try {
-      failures.posts += await addByPostListUrl(downloadManage, urls[i]);
+      await addByPostListUrl(downloadManage, urls[i], failures);
     } catch (e) {
       // 形状の不一致は「このページだけ落ちた」ではなく API 仕様変更なので、
       // 読み飛ばすと中身のない結果を成功として出してしまう
-      if (e instanceof ApiShapeError) {
-        console.error('投稿一覧の形状が想定外:', e);
-        alert('FANBOX API の仕様が変わった可能性があります。取得を中止しました');
+      if (isCollectionAbortError(e)) {
+        console.error('取得を中止:', e);
+        alert(ABORT_MESSAGE);
         return undefined;
       }
       // 1 ページには複数の投稿が載るため、欠落数は不明
@@ -212,31 +302,41 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
  * 投稿リストURLからURLリストに追加
  * @param downloadManage ダウンロード設定
  * @param url
+ * @param failures 取得できなかった件数の内訳。呼び出し側と共有して加算する
  */
-async function addByPostListUrl(downloadManage: DownloadManage, url: string): Promise<number> {
+async function addByPostListUrl(downloadManage: DownloadManage, url: string, failures: FailureCounts): Promise<void> {
   const postList = unwrapArray<PostListItem>(
     DownloadManage.utils.httpGetAs<PostList>(url)?.body?.posts,
     url,
     (item) => {
       const post = item as PostListItem | null;
-      return !!post && typeof post.id === 'string' && typeof post.isRestricted === 'boolean';
+      // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
+      return (
+        !!post &&
+        typeof post.id === 'string' &&
+        typeof post.isRestricted === 'boolean' &&
+        typeof post.feeRequired === 'number'
+      );
     },
   );
   console.log(`投稿の数:${postList.length}`);
-  let failedPostCount = 0;
   for (const post of postList) {
     if (!downloadManage.isLimitValid()) break;
-    // 閲覧できない投稿も結果からは欠落するので数える。数えないと、一覧が全件
+    // 利用者が対象外にした投稿は失敗ではないので、詳細も叩かず数えもしない。
+    // addByPostInfo に任せると、詳細の取得が失敗したときに feeRequired が伝わらず
+    // missing-body として数えてしまう。
+    if (downloadManage.isIgnoreFree && post.feeRequired === 0) continue;
+    // 閲覧できない投稿は本文を取り込めないことが一覧の時点で確定しているので、post.info を
+    // 叩かずに数える (投稿ごとに 1 リクエスト削減できる)。数えないと、一覧が全件
     // isRestricted になったときに空の結果を「失敗 0 件」として出してしまう。
     if (post.isRestricted) {
-      if (!(downloadManage.isIgnoreFree && post.feeRequired === 0)) failedPostCount++;
+      failures.restricted++;
       continue;
     }
     // 一覧レスポンスに本文は含まれないため、投稿ごとに post.info を叩く必要がある
     await DownloadManage.utils.sleep(API_RATE_LIMIT_MS);
-    if (isFailure(addByPostInfo(downloadManage, getPostInfoById(post.id)))) failedPostCount++;
+    applyAddResult(addByPostInfo(downloadManage, getPostInfoById(post.id)), failures);
   }
-  return failedPostCount;
 }
 
 /**
