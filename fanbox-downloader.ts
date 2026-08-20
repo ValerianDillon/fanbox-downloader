@@ -38,7 +38,10 @@ type FailureCounts = {
 /** 収集を最後まで走査せずに打ち切った理由。部分結果は捨てず不完全と明示して返す */
 type StoppedReason = 'rate-limit-exhausted' | 'transport-exhausted';
 
-type CollectOutcome = { failures: FailureCounts; stoppedReason?: StoppedReason };
+/** 打ち切ったときに利用者へ示す情報。何件まで取れてどこで止まったかが分からないと確認できない */
+type StoppedInfo = { reason: StoppedReason; addedPostCount: number; page?: number };
+
+type CollectOutcome = { failures: FailureCounts; stopped?: StoppedInfo };
 
 /** 再試行枠を使い切った失敗か。使い切った時点で次の要求を出さない */
 function exhaustionReason(error: unknown): StoppedReason | undefined {
@@ -107,21 +110,22 @@ function abortCollection(error: unknown): undefined {
  * 欠けている構造的な不一致であり、支援額不足のような正常系では説明できない。数えて続行すると
  * 仕様変更に気付かないまま中身の欠けた結果を成功として出してしまう。
  */
-function applyAddResult(result: AddPostResult, counts: FailureCounts): void {
+function applyAddResult(result: AddPostResult, counts: FailureCounts): boolean {
   switch (result.status) {
     case 'added':
+      return true;
     case 'ignored':
-      return;
+      return false;
     case 'unavailable':
       switch (result.reason) {
         case 'restricted':
           counts.restricted++;
-          return;
+          return false;
         case 'missing-body':
           // missing-body には通信失敗や CORS も合流する (getPostInfoById がそれらを undefined
           // に丸め、addByPostInfo は理由を区別できないため)
           counts.missingBody++;
-          return;
+          return false;
         default: {
           // reason が増えたときに型検査で気付けるようにする
           const exhaustiveReason: never = result.reason;
@@ -130,7 +134,7 @@ function applyAddResult(result: AddPostResult, counts: FailureCounts): void {
       }
     case 'unsupported':
       counts.unsupported++;
-      return;
+      return false;
     case 'invalid':
       throw new PostBodyInvalidError(result.postId, result.type, result.missing);
     default: {
@@ -141,19 +145,24 @@ function applyAddResult(result: AddPostResult, counts: FailureCounts): void {
   }
 }
 
+/** 打ち切りの通知。原因と、どこまで取れてどこで止まったかを示す */
+function buildStoppedNotice(stopped: StoppedInfo): string {
+  const cause =
+    stopped.reason === 'rate-limit-exhausted'
+      ? 'レート制限のため途中で打ち切りました。'
+      : '通信に失敗したため途中で打ち切りました。';
+  const where = stopped.page === undefined ? '' : ` (${stopped.page} ページ目で停止)`;
+  return `${cause}\nここまでに取り込めた投稿: ${stopped.addedPostCount} 件${where}\n以降は取得していないため、不完全な結果です。`;
+}
+
 /**
  * 失敗件数から alert の文面を組み立てる。失敗が無ければ undefined を返す。
  * 原因は推測しない: missing-body には CORS・通信断・API 障害・レート制限・仕様変更・実際の
  * 本文欠落が合流しており、件数の比率からは識別できないため、断定すると誤誘導になる。
  * 確認が必要な区分を先に置き、正常系でも大量に出る restricted に埋もれないようにする。
  */
-export function buildFailureMessage(failures: FailureCounts, stoppedReason?: StoppedReason): string | undefined {
-  const stopped =
-    stoppedReason === 'rate-limit-exhausted'
-      ? 'レート制限のため途中で打ち切りました。取得できた分だけの不完全な結果です。'
-      : stoppedReason === 'transport-exhausted'
-        ? '通信に失敗したため途中で打ち切りました。取得できた分だけの不完全な結果です。'
-        : '';
+export function buildFailureMessage(failures: FailureCounts, stoppedInfo?: StoppedInfo): string | undefined {
+  const stopped = stoppedInfo ? buildStoppedNotice(stoppedInfo) : '';
   const needsAttention = [
     failures.missingBody > 0
       ? `- 投稿詳細を取得できないか、本文を利用できなかった投稿: ${failures.missingBody} 件`
@@ -268,21 +277,54 @@ export function parseRetryAfterMs(value: string | null, nowMs: number): number |
   if (!value) return undefined;
   const trimmed = value.trim();
   if (trimmed === '') return undefined;
-  const seconds = Number(trimmed);
-  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  // delay-seconds は 1*DIGIT。Number() に任せると 1e-3 や 0x10 まで受理し、
+  // 本来なら固定バックオフへ落ちるべき値がごく短い待機になってしまう
+  if (/^\d+$/.test(trimmed)) {
+    const ms = Number(trimmed) * 1000;
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+  // HTTP-date (IMF-fixdate) は必ず曜日名と月名を含む。英字を含まない値を Date.parse に
+  // 渡すと '-5' のような不正値まで解釈されてしまう
+  if (!/[A-Za-z]/.test(trimmed)) return undefined;
   const at = Date.parse(trimmed);
   if (Number.isNaN(at)) return undefined;
   return Math.max(0, at - nowMs);
 }
 
+/**
+ * abort 可能な待機。sleep 自体は signal を受け取らないので、abort との競争にする。
+ * 45 秒のバックオフや長い Retry-After の途中で中断できないと「即時伝播」の契約を満たせない。
+ */
+function waitAbortable(sleep: (ms: number) => Promise<void>, ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return sleep(ms);
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    sleep(ms).then(
+      () => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+function abortError(signal: AbortSignal): unknown {
+  if (signal.reason !== undefined) return signal.reason;
+  const error = new Error('取得を中断しました');
+  error.name = 'AbortError';
+  return error;
+}
+
 /** abort されていれば理由をそのまま投げる。再試行枠は消費しない */
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
-  const reason = signal.reason;
-  if (reason !== undefined) throw reason;
-  const error = new Error('取得を中断しました');
-  error.name = 'AbortError';
-  throw error;
+  throw abortError(signal);
 }
 
 type SessionDeps = { sleep: (ms: number) => Promise<void>; now: () => number };
@@ -324,12 +366,18 @@ export class ApiSession {
   async fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
     return this.serialize(async () => {
       const body = await this.request(url, signal);
+      let parsed: T;
       try {
-        return JSON.parse(body) as T;
+        parsed = JSON.parse(body) as T;
       } catch {
-        // 形状の問題は通信の問題ではないので再試行しない
+        // 形状の問題は通信の問題ではないので再試行しない。
+        // ここまで来た応答は成功として数えない (減衰の条件は「API 成功が継続」であり、
+        // 読めない本文を成功に数えると連続性の意味が崩れる)
+        this.onFailure();
         throw new ApiShapeError(url);
       }
+      this.onSuccess();
+      return parsed;
     });
   }
 
@@ -349,13 +397,14 @@ export class ApiSession {
       // abort は再試行枠を消費せず即座に伝播する。中断後に追加の要求を出さないため、
       // 待機の前後と発行の直前で見る
       throwIfAborted(signal);
-      await this.gate();
+      await this.gate(signal);
       throwIfAborted(signal);
       const result = await this.transport(url);
       if (result.kind === 'unobservable-failure') {
         // 観測できない失敗では間隔を上げない。通信障害をレート制限として学習しないため
+        this.onFailure();
         if (transportAttempt >= TRANSPORT_BACKOFF_MS.length) throw new TransportExhaustedError(url);
-        await this.deps.sleep(TRANSPORT_BACKOFF_MS[transportAttempt]);
+        await waitAbortable(this.deps.sleep, TRANSPORT_BACKOFF_MS[transportAttempt], signal);
         transportAttempt++;
         continue;
       }
@@ -363,20 +412,23 @@ export class ApiSession {
         this.onRateLimited();
         if (rateLimitAttempt >= RATE_LIMIT_BACKOFF_MS.length) throw new RateLimitExhaustedError(url);
         const wait = parseRetryAfterMs(result.retryAfter, this.deps.now()) ?? RATE_LIMIT_BACKOFF_MS[rateLimitAttempt];
-        await this.deps.sleep(wait);
+        await waitAbortable(this.deps.sleep, wait, signal);
         rateLimitAttempt++;
         continue;
       }
-      if (result.status < 200 || result.status >= 300) throw new HttpError(url, result.status);
-      this.onSuccess();
+      if (result.status < 200 || result.status >= 300) {
+        this.onFailure();
+        throw new HttpError(url, result.status);
+      }
+      // 成功として数えるのは本文を読めたときだけなので、ここでは数えない
       return result.body;
     }
   }
 
-  private async gate(): Promise<void> {
+  private async gate(signal?: AbortSignal): Promise<void> {
     if (this.lastRequestAt !== 0) {
       const wait = this.interval - (this.deps.now() - this.lastRequestAt);
-      if (wait > 0) await this.deps.sleep(wait);
+      if (wait > 0) await waitAbortable(this.deps.sleep, wait, signal);
     }
     this.lastRequestAt = this.deps.now();
   }
@@ -386,6 +438,11 @@ export class ApiSession {
     this.interval = Math.min(this.cap, Math.floor(this.interval * THROTTLE_FACTOR));
     this.successStreak = 0;
     this.lastRateLimitAt = this.deps.now();
+  }
+
+  /** 成功以外はすべて連続成功を切る。減衰の条件は「継続」であり、間に失敗を挟めば継続ではない */
+  private onFailure(): void {
+    this.successStreak = 0;
   }
 
   private onSuccess(): void {
@@ -476,9 +533,12 @@ export async function searchBy(
     const reason = exhaustionReason(e);
     if (reason) {
       console.error('プラン情報の取得を中止:', e);
-      alert(buildFailureMessage(emptyFailureCounts(), reason));
+      alert(buildFailureMessage(emptyFailureCounts(), { reason, addedPostCount: 0 }));
       return;
     }
+    // 表示の補助として想定しているのは HTTP エラーと形状の不一致だけ。
+    // 想定外の例外は実装上のバグでありうるので、続行せず中止する
+    if (!(e instanceof HttpError || e instanceof ApiShapeError)) return abortCollection(e);
     console.error('プラン情報の取得に失敗:', e);
   }
   const feeMapper = new Map<number, string>();
@@ -499,9 +559,10 @@ export async function searchBy(
     const reason = exhaustionReason(e);
     if (reason) {
       console.error('タグ情報の取得を中止:', e);
-      alert(buildFailureMessage(emptyFailureCounts(), reason));
+      alert(buildFailureMessage(emptyFailureCounts(), { reason, addedPostCount: 0 }));
       return;
     }
+    if (!(e instanceof HttpError || e instanceof ApiShapeError)) return abortCollection(e);
     console.error('タグ情報の取得に失敗:', e);
   }
   let outcome: CollectOutcome;
@@ -514,7 +575,7 @@ export async function searchBy(
       const reason = exhaustionReason(e);
       if (reason) {
         console.error('取得を中止:', e);
-        alert(buildFailureMessage(failures, reason));
+        alert(buildFailureMessage(failures, { reason, addedPostCount: 0 }));
         return;
       }
       // 一覧モードと同じく、中止すべき失敗は投稿単位の失敗に丸めず結果自体を返さない
@@ -528,7 +589,7 @@ export async function searchBy(
     outcome = collected;
   }
   downloadSettings.applyTags();
-  const message = buildFailureMessage(outcome.failures, outcome.stoppedReason);
+  const message = buildFailureMessage(outcome.failures, outcome.stopped);
   if (message) alert(message);
   return downloadSettings.downloadObject;
 }
@@ -562,14 +623,18 @@ async function getItemsById(session: ApiSession, downloadManage: DownloadManage)
     const reason = exhaustionReason(e);
     if (reason) {
       console.error('投稿一覧の取得を中止:', e);
-      alert(buildFailureMessage(emptyFailureCounts(), reason));
+      alert(buildFailureMessage(emptyFailureCounts(), { reason, addedPostCount: 0 }));
       return undefined;
     }
+    // 「取得に失敗した」で片付けてよいのは HTTP エラーだけ
+    if (!(e instanceof HttpError)) return abortCollection(e);
     console.error('投稿一覧の取得に失敗:', e);
     alert('投稿一覧の取得に失敗しました');
     return undefined;
   }
   const failures = emptyFailureCounts();
+  // 打ち切ったときに「何件まで取れたか」を示すため、途中経過を共有の入れ物で持つ
+  const progress = { addedPostCount: 0 };
   for (let i = 0; i < urls.length; i++) {
     console.log(`${i + 1}回目`);
     try {
@@ -577,7 +642,7 @@ async function getItemsById(session: ApiSession, downloadManage: DownloadManage)
       // 投稿単位の処理とは try を分ける。まとめて囲むと投稿側の想定外の例外まで
       // 「ページが 1 枚落ちた」ことにされ、原因の分類を誤る。
       const postList = await fetchPostList(session, urls[i], i, failures);
-      if (postList) await addPostList(session, downloadManage, postList, failures);
+      if (postList) await addPostList(session, downloadManage, postList, failures, progress);
     } catch (e) {
       // 再試行枠を使い切ったら次のページへ進まない。オフラインなら待ち続ける利益が小さく、
       // 非可視の 429 だった場合に残りを要求し続けるのは危険。
@@ -585,7 +650,7 @@ async function getItemsById(session: ApiSession, downloadManage: DownloadManage)
       const reason = exhaustionReason(e);
       if (reason) {
         console.error('収集を打ち切り:', e);
-        return { failures, stoppedReason: reason };
+        return { failures, stopped: { reason, addedPostCount: progress.addedPostCount, page: i + 1 } };
       }
       return abortCollection(e);
     }
@@ -640,6 +705,7 @@ async function addPostList(
   downloadManage: DownloadManage,
   postList: PostListItem[],
   failures: FailureCounts,
+  progress: { addedPostCount: number },
 ): Promise<void> {
   console.log(`投稿の数:${postList.length}`);
   for (const post of postList) {
@@ -657,7 +723,9 @@ async function addPostList(
     }
     // 一覧レスポンスに本文は含まれないため、投稿ごとに post.info を叩く必要がある
     // (発行間隔はセッションのゲートが担うので、ここで待たない)
-    applyAddResult(addByPostInfo(downloadManage, await getPostInfoById(session, post.id)), failures);
+    if (applyAddResult(addByPostInfo(downloadManage, await getPostInfoById(session, post.id)), failures)) {
+      progress.addedPostCount++;
+    }
   }
 }
 

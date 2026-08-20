@@ -15,6 +15,7 @@ import {
   ApiSession,
   buildFailureMessage,
   HttpError,
+  pageOriginTransport,
   parseRetryAfterMs,
   RateLimitExhaustedError,
   searchBy,
@@ -217,16 +218,26 @@ describe('buildFailureMessage', () => {
   // 全区分の完全一致で、件数・順序・余分な区分・原因を推測する文言の混入をまとめて固定する
   // (原因を書かないのは、missing-body に CORS・通信断・API 障害・レート制限・仕様変更・
   // 実際の本文欠落が合流しており、件数からは識別できないため)
-  test('レート制限で打ち切ったことを先頭で伝える', () => {
-    const message = buildFailureMessage(counts({ missingBody: 1 }), 'rate-limit-exhausted') ?? '';
+  test('レート制限で打ち切ったことを先頭で伝え、どこまで取れたかを示す', () => {
+    const message =
+      buildFailureMessage(counts({ missingBody: 1 }), {
+        reason: 'rate-limit-exhausted',
+        addedPostCount: 12,
+        page: 3,
+      }) ?? '';
     expect(message.startsWith('レート制限のため途中で打ち切りました')).toBe(true);
+    expect(message).toContain('ここまでに取り込めた投稿: 12 件');
+    expect(message).toContain('3 ページ目で停止');
     expect(message).toContain('不完全な結果');
     expect(message).toContain('確認が必要な未取得');
   });
 
   test('失敗件数が 0 でも打ち切りは伝える', () => {
-    const message = buildFailureMessage(counts(), 'transport-exhausted') ?? '';
+    const message = buildFailureMessage(counts(), { reason: 'transport-exhausted', addedPostCount: 0 }) ?? '';
     expect(message.startsWith('通信に失敗したため途中で打ち切りました')).toBe(true);
+    expect(message).toContain('ここまでに取り込めた投稿: 0 件');
+    // ページが分からない経路では位置を書かない
+    expect(message).not.toContain('ページ目で停止');
   });
 
   test('全区分が併存するとき、確認が必要な区分を先に置いて原因は書かない', () => {
@@ -624,6 +635,82 @@ describe('parseRetryAfterMs', () => {
   });
 });
 
+describe('pageOriginTransport', () => {
+  // biome-ignore lint/suspicious/noExplicitAny: global stubs
+  const g = globalThis as any;
+  const origXhr = g.XMLHttpRequest;
+
+  type XhrPlan = { throwOnSend?: boolean; status?: number; text?: string; headers?: Record<string, string> };
+  let plan: XhrPlan;
+  let opened: { method: string; url: string; async: boolean } | undefined;
+  let withCredentials: boolean | undefined;
+
+  function stubXhr(next: XhrPlan) {
+    plan = next;
+    opened = undefined;
+    withCredentials = undefined;
+    g.XMLHttpRequest = class {
+      status = 0;
+      responseText = '';
+      withCredentials = false;
+      open(method: string, url: string, async: boolean) {
+        opened = { method, url, async };
+      }
+      send() {
+        withCredentials = this.withCredentials;
+        if (plan.throwOnSend) throw new Error('NetworkError');
+        this.status = plan.status ?? 200;
+        this.responseText = plan.text ?? '';
+      }
+      getResponseHeader(name: string) {
+        return plan.headers?.[name.toLowerCase()] ?? null;
+      }
+    };
+  }
+
+  afterEach(() => {
+    g.XMLHttpRequest = origXhr;
+  });
+
+  test('同期 XHR を資格情報つきで発行する', async () => {
+    stubXhr({ status: 200, text: '{}' });
+    await pageOriginTransport('https://api.fanbox.cc/x');
+    expect(opened).toEqual({ method: 'GET', url: 'https://api.fanbox.cc/x', async: false });
+    expect(withCredentials).toBe(true);
+  });
+
+  test('応答を読めたら status と本文を返す', async () => {
+    stubXhr({ status: 200, text: '{"a":1}' });
+    expect(await pageOriginTransport('https://api.fanbox.cc/x')).toEqual({
+      kind: 'response',
+      status: 200,
+      body: '{"a":1}',
+      retryAfter: null,
+    });
+  });
+
+  test('2xx 以外も response として返す (status を捨てない)', async () => {
+    stubXhr({ status: 429, text: '', headers: { 'retry-after': '30' } });
+    expect(await pageOriginTransport('https://api.fanbox.cc/x')).toEqual({
+      kind: 'response',
+      status: 429,
+      body: '',
+      retryAfter: '30',
+    });
+  });
+
+  test('send が例外なら status を推測せず unobservable-failure にする', async () => {
+    stubXhr({ throwOnSend: true });
+    const result = await pageOriginTransport('https://api.fanbox.cc/x');
+    expect(result.kind).toBe('unobservable-failure');
+  });
+
+  test('status 0 も unobservable-failure にする', async () => {
+    stubXhr({ status: 0, text: '' });
+    expect(await pageOriginTransport('https://api.fanbox.cc/x')).toEqual({ kind: 'unobservable-failure' });
+  });
+});
+
 describe('ApiSession - transport 契約と再試行ポリシー', () => {
   const URL = 'https://api.fanbox.cc/post.info?postId=1';
 
@@ -757,6 +844,62 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
     const h = createHarness([{ kind: 'response', status: 404, body: '', retryAfter: null }, ok('{"n":2}')]);
     await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(HttpError);
     expect(await h.session.fetchJson<{ n: number }>(URL)).toEqual({ n: 2 });
+  });
+
+  test('連続する成功要求の間に発行間隔ぶんの待機が入る', async () => {
+    const h = createHarness([ok('{}'), ok('{}')], 500);
+    await h.session.fetchJson(URL);
+    await h.session.fetchJson(URL);
+    // gate() の待機を外すとこの期待が落ちる
+    expect(h.waits).toEqual([500]);
+  });
+
+  test('失敗を挟むと連続成功が切れ、減衰しない', async () => {
+    // 429 で 750ms に上がったあと、成功 19 回 → HTTP 500 → 成功 1 回。
+    // 「20 回継続」ではないので減衰させない
+    const results: TransportResult[] = [tooMany(), ...Array(19).fill(ok('{}'))];
+    results.push({ kind: 'response', status: 500, body: '', retryAfter: null });
+    results.push(ok('{}'));
+    const h = createHarness(results, 500);
+    // 1 回目の呼び出しが 429 と再試行の成功で 2 件消費するので、成功 19 回ぶんは 19 呼び出し
+    for (let i = 0; i < 19; i++) await h.session.fetchJson(URL);
+    expect(h.session.intervalMs).toBe(750);
+    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(HttpError);
+    h.advance(120_000);
+    await h.session.fetchJson(URL);
+    expect(h.session.intervalMs).toBe(750);
+  });
+
+  test('レート制限なしで成功が継続し静穏期間が過ぎたら減衰する', async () => {
+    const h = createHarness([tooMany(), ...Array(20).fill(ok('{}'))], 500);
+    // 1 回目の呼び出しで 429 → 再試行成功。以降 19 回成功して合計 20 回
+    for (let i = 0; i < 20; i++) {
+      h.advance(120_000);
+      await h.session.fetchJson(URL);
+    }
+    expect(h.session.intervalMs).toBe(600);
+  });
+
+  test('読めない本文は成功として数えない', async () => {
+    const h = createHarness([tooMany(), ...Array(19).fill(ok('{}')), ok('<html>'), ok('{}')], 500);
+    for (let i = 0; i < 19; i++) await h.session.fetchJson(URL);
+    await expect(h.session.fetchJson(URL)).rejects.toThrow('API レスポンスの形状が想定外');
+    h.advance(120_000);
+    await h.session.fetchJson(URL);
+    expect(h.session.intervalMs).toBe(750);
+  });
+
+  test('待機の途中で中断できる', async () => {
+    const controller = new AbortController();
+    const transport = async (): Promise<TransportResult> => ({ kind: 'unobservable-failure' });
+    const session = new ApiSession(0, transport, {
+      // 待機は解決しない。abort でのみ抜けられることを確かめる
+      sleep: () => new Promise<void>(() => {}),
+      now: () => 0,
+    });
+    const pending = session.fetchJson(URL, controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toBeDefined();
   });
 
   test('中断済みの signal では要求を出さない', async () => {
