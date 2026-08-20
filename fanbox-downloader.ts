@@ -3,14 +3,14 @@ import {
   type AddPostResult,
   addByPostInfo,
   DownloadManage,
-  type PaginatedPosts,
   type PlanInfo,
-  type Plans,
+  type PlansResponse,
   type PostInfo,
   type PostInfoResponse,
-  type PostList,
   type PostListItem,
-  type Tags,
+  type PostListResponse,
+  type PostPaginationResponse,
+  type TagsResponse,
 } from 'download-helper/fanbox-collector';
 
 // 一覧に本文が載らなくなり投稿ごとに post.info を叩くようになったため、
@@ -228,7 +228,7 @@ export async function searchBy(
   try {
     // プラン名は支援額タグの表示名に使うだけなので、失敗しても収集は続ける
     plans = unwrapArray<PlanInfo>(
-      DownloadManage.utils.httpGetAs<Plans>(planUrl)?.body?.plans,
+      DownloadManage.utils.httpGetAs<PlansResponse>(planUrl)?.body?.plans,
       planUrl,
       (item) => typeof (item as PlanInfo | null)?.fee === 'number',
     );
@@ -244,7 +244,7 @@ export async function searchBy(
   const tagUrl = `https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`;
   try {
     const definedTags = unwrapArray<{ tag: string }>(
-      DownloadManage.utils.httpGetAs<Tags>(tagUrl)?.body?.featuredTags,
+      DownloadManage.utils.httpGetAs<TagsResponse>(tagUrl)?.body?.featuredTags,
       tagUrl,
       (item) => typeof (item as { tag?: unknown } | null)?.tag === 'string',
     ).map((tag) => tag.tag);
@@ -291,7 +291,7 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
   let urls: string[];
   try {
     urls = unwrapArray<string>(
-      DownloadManage.utils.httpGetAs<PaginatedPosts>(paginateUrl)?.body?.pageUrls,
+      DownloadManage.utils.httpGetAs<PostPaginationResponse>(paginateUrl)?.body?.pageUrls,
       paginateUrl,
       (item) => typeof item === 'string',
     );
@@ -328,16 +328,20 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
  */
 function fetchPostList(url: string, index: number, failures: FailureCounts): PostListItem[] | undefined {
   try {
-    return unwrapArray<PostListItem>(DownloadManage.utils.httpGetAs<PostList>(url)?.body?.posts, url, (item) => {
-      const post = item as PostListItem | null;
-      // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
-      return (
-        !!post &&
-        typeof post.id === 'string' &&
-        typeof post.isRestricted === 'boolean' &&
-        typeof post.feeRequired === 'number'
-      );
-    });
+    return unwrapArray<PostListItem>(
+      DownloadManage.utils.httpGetAs<PostListResponse>(url)?.body?.posts,
+      url,
+      (item) => {
+        const post = item as PostListItem | null;
+        // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
+        return (
+          !!post &&
+          typeof post.id === 'string' &&
+          typeof post.isRestricted === 'boolean' &&
+          typeof post.feeRequired === 'number'
+        );
+      },
+    );
   } catch (e) {
     if (isCollectionAbortError(e)) throw e;
     // 1 ページには複数の投稿が載るため、欠落数は不明
