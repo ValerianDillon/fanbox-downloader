@@ -35,6 +35,18 @@ type FailureCounts = {
   pages: number;
 };
 
+/** 収集を最後まで走査せずに打ち切った理由。部分結果は捨てず不完全と明示して返す */
+type StoppedReason = 'rate-limit-exhausted' | 'transport-exhausted';
+
+type CollectOutcome = { failures: FailureCounts; stoppedReason?: StoppedReason };
+
+/** 再試行枠を使い切った失敗か。使い切った時点で次の要求を出さない */
+function exhaustionReason(error: unknown): StoppedReason | undefined {
+  if (error instanceof RateLimitExhaustedError) return 'rate-limit-exhausted';
+  if (error instanceof TransportExhaustedError) return 'transport-exhausted';
+  return undefined;
+}
+
 function emptyFailureCounts(): FailureCounts {
   return { restricted: 0, missingBody: 0, unsupported: 0, pages: 0 };
 }
@@ -135,7 +147,13 @@ function applyAddResult(result: AddPostResult, counts: FailureCounts): void {
  * 本文欠落が合流しており、件数の比率からは識別できないため、断定すると誤誘導になる。
  * 確認が必要な区分を先に置き、正常系でも大量に出る restricted に埋もれないようにする。
  */
-export function buildFailureMessage(failures: FailureCounts): string | undefined {
+export function buildFailureMessage(failures: FailureCounts, stoppedReason?: StoppedReason): string | undefined {
+  const stopped =
+    stoppedReason === 'rate-limit-exhausted'
+      ? 'レート制限のため途中で打ち切りました。取得できた分だけの不完全な結果です。'
+      : stoppedReason === 'transport-exhausted'
+        ? '通信に失敗したため途中で打ち切りました。取得できた分だけの不完全な結果です。'
+        : '';
   const needsAttention = [
     failures.missingBody > 0
       ? `- 投稿詳細を取得できないか、本文を利用できなかった投稿: ${failures.missingBody} 件`
@@ -144,15 +162,17 @@ export function buildFailureMessage(failures: FailureCounts): string | undefined
     failures.pages > 0 ? `- 取得できなかった投稿一覧: ${failures.pages} ページ (欠落した投稿数は不明)` : '',
   ].filter(Boolean);
   if (needsAttention.length === 0) {
-    if (failures.restricted === 0) return undefined;
+    if (failures.restricted === 0) return stopped || undefined;
     // 閲覧制限だけなら異常ではないので、見出しを付けずに 1 行で伝える
-    return `閲覧制限により取得できなかった投稿: ${failures.restricted} 件`;
+    const line = `閲覧制限により取得できなかった投稿: ${failures.restricted} 件`;
+    return stopped ? `${stopped}\n\n${line}` : line;
   }
   const sections = [`確認が必要な未取得:\n${needsAttention.join('\n')}`];
   if (failures.restricted > 0) {
     sections.push(`閲覧条件による未取得:\n- 閲覧制限のある投稿: ${failures.restricted} 件`);
   }
-  return `一部の投稿を取得できませんでした。\n\n${sections.join('\n\n')}`;
+  const body = `一部の投稿を取得できませんでした。\n\n${sections.join('\n\n')}`;
+  return stopped ? `${stopped}\n\n${body}` : body;
 }
 
 function unwrapArray<T>(value: unknown, url: string, isValidItem?: (item: unknown) => boolean): T[] {
@@ -160,6 +180,221 @@ function unwrapArray<T>(value: unknown, url: string, isValidItem?: (item: unknow
     throw new ApiShapeError(url);
   }
   return value as T[];
+}
+
+/**
+ * 取得できた応答。status が読めたという事実だけを表す。
+ */
+export type TransportResponse = { kind: 'response'; status: number; body: string; retryAfter: string | null };
+
+/**
+ * 応答を得られなかった失敗。CORS・DNS・オフライン・TLS などが該当する。
+ * status を推測しない: 非可視の 429 かもしれないが、それは観測ではなく推測である。
+ */
+export type TransportFailure = { kind: 'unobservable-failure'; cause?: unknown };
+
+export type TransportResult = TransportResponse | TransportFailure;
+
+export type Transport = (url: string) => Promise<TransportResult>;
+
+/**
+ * ページ origin から同期 XHR で取得する transport。
+ * 読めるヘッダは CORS セーフリストに限られるため Retry-After は通常 null になる。
+ * それでも読みに行くのは、サーバが Access-Control-Expose-Headers を返すようになれば
+ * 実装を変えずに使えるようにするため。
+ */
+export const pageOriginTransport: Transport = async (url) => {
+  const xhr = new XMLHttpRequest();
+  try {
+    xhr.open('GET', url, false);
+    xhr.withCredentials = true;
+    xhr.send(null);
+  } catch (cause) {
+    // 応答を観測できていないので status は推測しない
+    return { kind: 'unobservable-failure', cause };
+  }
+  // 同期 XHR は通信断で例外を投げるが、status 0 で返る経路もある
+  if (xhr.status === 0) return { kind: 'unobservable-failure' };
+  return {
+    kind: 'response',
+    status: xhr.status,
+    body: xhr.responseText,
+    retryAfter: xhr.getResponseHeader('Retry-After'),
+  };
+};
+
+/** 2xx 以外の応答。自動再試行の対象にしない */
+export class HttpError extends Error {
+  readonly status: number;
+  constructor(url: string, status: number) {
+    super(`HTTP ${status}: ${url}`);
+    this.name = 'HttpError';
+    this.status = status;
+  }
+}
+
+/** 429 の再試行枠を使い切った */
+export class RateLimitExhaustedError extends Error {
+  constructor(url: string) {
+    super(`レート制限の再試行上限に達しました: ${url}`);
+    this.name = 'RateLimitExhaustedError';
+  }
+}
+
+/** 応答を観測できない失敗の再試行枠を使い切った */
+export class TransportExhaustedError extends Error {
+  constructor(url: string) {
+    super(`通信の再試行上限に達しました: ${url}`);
+    this.name = 'TransportExhaustedError';
+  }
+}
+
+/** exact 429 に対する待機。Retry-After が読めればそちらを優先する */
+const RATE_LIMIT_BACKOFF_MS = [5_000, 15_000, 45_000];
+/**
+ * 観測できない失敗に対する待機。429 より短いのは、ここにオフラインや一時的な通信障害が
+ * 多く含まれ、長く待つ根拠となる観測情報が無いため。1 回で見切らないのは、数百投稿を
+ * 数分かけて収集する用途では一瞬の通信断に当たる確率が無視できないため。
+ */
+const TRANSPORT_BACKOFF_MS = [5_000, 15_000];
+const THROTTLE_FACTOR = 1.5;
+const THROTTLE_DECAY_DIVISOR = 1.25;
+const THROTTLE_CAP_FLOOR_MS = 3_000;
+const DECAY_SUCCESS_STREAK = 20;
+const DECAY_QUIET_MS = 60_000;
+
+/** Retry-After を待機ミリ秒へ変換する。秒数形式と HTTP-date 形式を受け、不正値は undefined */
+export function parseRetryAfterMs(value: string | null, nowMs: number): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (trimmed === '') return undefined;
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return undefined;
+  return Math.max(0, at - nowMs);
+}
+
+/** abort されていれば理由をそのまま投げる。再試行枠は消費しない */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  if (reason !== undefined) throw reason;
+  const error = new Error('取得を中断しました');
+  error.name = 'AbortError';
+  throw error;
+}
+
+type SessionDeps = { sleep: (ms: number) => Promise<void>; now: () => number };
+
+/**
+ * FANBOX API 呼び出しのレート制御セッション。
+ * 全エンドポイントをここに通し、待機だけでなく発行から応答処理までを直列化する。
+ * ゲートだけ排他化すると、待機を終えた複数の呼び出しが同時に発行されうる。
+ *
+ * 収集ごとに作る。前回の収集で引き上がった間隔を次へ持ち越さないため。
+ */
+export class ApiSession {
+  private chain: Promise<unknown> = Promise.resolve();
+  private lastRequestAt = 0;
+  private interval: number;
+  private successStreak = 0;
+  private lastRateLimitAt = 0;
+  private readonly cap: number;
+
+  constructor(
+    private readonly baseInterval: number,
+    private readonly transport: Transport = pageOriginTransport,
+    private readonly deps: SessionDeps = {
+      sleep: async (ms) => {
+        await DownloadManage.utils.sleep(ms);
+      },
+      now: () => Date.now(),
+    },
+  ) {
+    this.interval = baseInterval;
+    this.cap = Math.max(baseInterval, THROTTLE_CAP_FLOOR_MS);
+  }
+
+  /** 現在の発行間隔。適応スロットルの検証用に公開する */
+  get intervalMs(): number {
+    return this.interval;
+  }
+
+  async fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+    return this.serialize(async () => {
+      const body = await this.request(url, signal);
+      try {
+        return JSON.parse(body) as T;
+      } catch {
+        // 形状の問題は通信の問題ではないので再試行しない
+        throw new ApiShapeError(url);
+      }
+    });
+  }
+
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(task, task);
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async request(url: string, signal?: AbortSignal): Promise<string> {
+    let rateLimitAttempt = 0;
+    let transportAttempt = 0;
+    for (;;) {
+      // abort は再試行枠を消費せず即座に伝播する。中断後に追加の要求を出さないため、
+      // 待機の前後と発行の直前で見る
+      throwIfAborted(signal);
+      await this.gate();
+      throwIfAborted(signal);
+      const result = await this.transport(url);
+      if (result.kind === 'unobservable-failure') {
+        // 観測できない失敗では間隔を上げない。通信障害をレート制限として学習しないため
+        if (transportAttempt >= TRANSPORT_BACKOFF_MS.length) throw new TransportExhaustedError(url);
+        await this.deps.sleep(TRANSPORT_BACKOFF_MS[transportAttempt]);
+        transportAttempt++;
+        continue;
+      }
+      if (result.status === 429) {
+        this.onRateLimited();
+        if (rateLimitAttempt >= RATE_LIMIT_BACKOFF_MS.length) throw new RateLimitExhaustedError(url);
+        const wait = parseRetryAfterMs(result.retryAfter, this.deps.now()) ?? RATE_LIMIT_BACKOFF_MS[rateLimitAttempt];
+        await this.deps.sleep(wait);
+        rateLimitAttempt++;
+        continue;
+      }
+      if (result.status < 200 || result.status >= 300) throw new HttpError(url, result.status);
+      this.onSuccess();
+      return result.body;
+    }
+  }
+
+  private async gate(): Promise<void> {
+    if (this.lastRequestAt !== 0) {
+      const wait = this.interval - (this.deps.now() - this.lastRequestAt);
+      if (wait > 0) await this.deps.sleep(wait);
+    }
+    this.lastRequestAt = this.deps.now();
+  }
+
+  /** 引き上げは exact 429 の観測だけを根拠にする */
+  private onRateLimited(): void {
+    this.interval = Math.min(this.cap, Math.floor(this.interval * THROTTLE_FACTOR));
+    this.successStreak = 0;
+    this.lastRateLimitAt = this.deps.now();
+  }
+
+  private onSuccess(): void {
+    this.successStreak++;
+    if (this.successStreak < DECAY_SUCCESS_STREAK) return;
+    if (this.lastRateLimitAt !== 0 && this.deps.now() - this.lastRateLimitAt < DECAY_QUIET_MS) return;
+    this.interval = Math.max(this.baseInterval, Math.floor(this.interval / THROTTLE_DECAY_DIVISOR));
+    this.successStreak = 0;
+  }
 }
 
 /**
@@ -218,6 +453,9 @@ export async function main() {
 export async function searchBy(
   creatorId: string | undefined,
   postId: string | undefined,
+  // レート制御の状態は収集ごとに持つ。前回の収集で引き上がった間隔を次へ持ち越さない。
+  // 差し替え可能にしているのは、契約テストから transport を注入するため
+  session: ApiSession = new ApiSession(API_RATE_LIMIT_MS),
 ): Promise<DownloadObject | undefined> {
   if (!creatorId) {
     alert('しらないURL');
@@ -228,11 +466,19 @@ export async function searchBy(
   try {
     // プラン名は支援額タグの表示名に使うだけなので、失敗しても収集は続ける
     plans = unwrapArray<PlanInfo>(
-      DownloadManage.utils.httpGetAs<PlansResponse>(planUrl)?.body?.plans,
+      (await session.fetchJson<PlansResponse>(planUrl))?.body?.plans,
       planUrl,
       (item) => typeof (item as PlanInfo | null)?.fee === 'number',
     );
   } catch (e) {
+    // 枯渇だけは握りつぶさない。既に上限まで待った直後に別のエンドポイントへ要求を出すのは、
+    // 再試行上限を別経路で実質的に延長することになる
+    const reason = exhaustionReason(e);
+    if (reason) {
+      console.error('プラン情報の取得を中止:', e);
+      alert(buildFailureMessage(emptyFailureCounts(), reason));
+      return;
+    }
     console.error('プラン情報の取得に失敗:', e);
   }
   const feeMapper = new Map<number, string>();
@@ -244,31 +490,45 @@ export async function searchBy(
   const tagUrl = `https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`;
   try {
     const definedTags = unwrapArray<{ tag: string }>(
-      DownloadManage.utils.httpGetAs<TagsResponse>(tagUrl)?.body?.featuredTags,
+      (await session.fetchJson<TagsResponse>(tagUrl))?.body?.featuredTags,
       tagUrl,
       (item) => typeof (item as { tag?: unknown } | null)?.tag === 'string',
     ).map((tag) => tag.tag);
     downloadSettings.addTags(...definedTags);
   } catch (e) {
+    const reason = exhaustionReason(e);
+    if (reason) {
+      console.error('タグ情報の取得を中止:', e);
+      alert(buildFailureMessage(emptyFailureCounts(), reason));
+      return;
+    }
     console.error('タグ情報の取得に失敗:', e);
   }
-  let failures: FailureCounts;
+  let outcome: CollectOutcome;
   if (postId) {
-    failures = emptyFailureCounts();
+    const failures = emptyFailureCounts();
     try {
-      applyAddResult(addByPostInfo(downloadSettings, getPostInfoById(postId)), failures);
+      applyAddResult(addByPostInfo(downloadSettings, await getPostInfoById(session, postId)), failures);
     } catch (e) {
+      // 単一投稿では部分結果というものが無いので、枯渇でも結果を返さない
+      const reason = exhaustionReason(e);
+      if (reason) {
+        console.error('取得を中止:', e);
+        alert(buildFailureMessage(failures, reason));
+        return;
+      }
       // 一覧モードと同じく、中止すべき失敗は投稿単位の失敗に丸めず結果自体を返さない
       return abortCollection(e);
     }
+    outcome = { failures };
   } else {
-    const collected = await getItemsById(downloadSettings);
+    const collected = await getItemsById(session, downloadSettings);
     // 形状エラーで中止したときは、途中までの結果を成功として出さない
     if (!collected) return;
-    failures = collected;
+    outcome = collected;
   }
   downloadSettings.applyTags();
-  const message = buildFailureMessage(failures);
+  const message = buildFailureMessage(outcome.failures, outcome.stoppedReason);
   if (message) alert(message);
   return downloadSettings.downloadObject;
 }
@@ -277,7 +537,7 @@ export async function searchBy(
  * ユーザーIDからitemsを得る
  * @param downloadManage ダウンロード設定
  */
-async function getItemsById(downloadManage: DownloadManage): Promise<FailureCounts | undefined> {
+async function getItemsById(session: ApiSession, downloadManage: DownloadManage): Promise<CollectOutcome | undefined> {
   downloadManage.isIgnoreFree = confirm('無料コンテンツを省く？');
   const limitBase = prompt('取得制限数を入力 キャンセルで全て取得');
   if (limitBase) {
@@ -291,13 +551,20 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
   let urls: string[];
   try {
     urls = unwrapArray<string>(
-      DownloadManage.utils.httpGetAs<PostPaginationResponse>(paginateUrl)?.body?.pageUrls,
+      (await session.fetchJson<PostPaginationResponse>(paginateUrl))?.body?.pageUrls,
       paginateUrl,
       (item) => typeof item === 'string',
     );
   } catch (e) {
     // 形状の不一致はページ取得の失敗ではなく仕様変更なので、他の経路と同じ文言で中止する
     if (isCollectionAbortError(e)) return abortCollection(e);
+    // 1 件も集まっていないので、枯渇でも部分結果として返すものが無い
+    const reason = exhaustionReason(e);
+    if (reason) {
+      console.error('投稿一覧の取得を中止:', e);
+      alert(buildFailureMessage(emptyFailureCounts(), reason));
+      return undefined;
+    }
     console.error('投稿一覧の取得に失敗:', e);
     alert('投稿一覧の取得に失敗しました');
     return undefined;
@@ -309,14 +576,21 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
       // ページ単位の失敗として数えてよいのは一覧の取得・検証で出た例外だけなので、
       // 投稿単位の処理とは try を分ける。まとめて囲むと投稿側の想定外の例外まで
       // 「ページが 1 枚落ちた」ことにされ、原因の分類を誤る。
-      const postList = fetchPostList(urls[i], i, failures);
-      if (postList) await addPostList(downloadManage, postList, failures);
+      const postList = await fetchPostList(session, urls[i], i, failures);
+      if (postList) await addPostList(session, downloadManage, postList, failures);
     } catch (e) {
+      // 再試行枠を使い切ったら次のページへ進まない。オフラインなら待ち続ける利益が小さく、
+      // 非可視の 429 だった場合に残りを要求し続けるのは危険。
+      // ただし集めた分は捨てず、不完全と明示して返す。
+      const reason = exhaustionReason(e);
+      if (reason) {
+        console.error('収集を打ち切り:', e);
+        return { failures, stoppedReason: reason };
+      }
       return abortCollection(e);
     }
-    await DownloadManage.utils.sleep(API_RATE_LIMIT_MS);
   }
-  return failures;
+  return { failures };
 }
 
 /**
@@ -326,24 +600,28 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
  * @param index 何ページ目か (ログ用の 0 始まり)
  * @param failures 取得できなかった件数の内訳。呼び出し側と共有して加算する
  */
-function fetchPostList(url: string, index: number, failures: FailureCounts): PostListItem[] | undefined {
+async function fetchPostList(
+  session: ApiSession,
+  url: string,
+  index: number,
+  failures: FailureCounts,
+): Promise<PostListItem[] | undefined> {
   try {
-    return unwrapArray<PostListItem>(
-      DownloadManage.utils.httpGetAs<PostListResponse>(url)?.body?.posts,
-      url,
-      (item) => {
-        const post = item as PostListItem | null;
-        // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
-        return (
-          !!post &&
-          typeof post.id === 'string' &&
-          typeof post.isRestricted === 'boolean' &&
-          typeof post.feeRequired === 'number'
-        );
-      },
-    );
+    return unwrapArray<PostListItem>((await session.fetchJson<PostListResponse>(url))?.body?.posts, url, (item) => {
+      const post = item as PostListItem | null;
+      // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
+      return (
+        !!post &&
+        typeof post.id === 'string' &&
+        typeof post.isRestricted === 'boolean' &&
+        typeof post.feeRequired === 'number'
+      );
+    });
   } catch (e) {
-    if (isCollectionAbortError(e)) throw e;
+    // ページ単位の失敗として数えてよいのは HTTP エラーだけ。枯渇はこのページだけの
+    // 失敗ではなく、想定外の例外は実装上のバグでありうるので、どちらも呼び出し側へ渡す。
+    // 丸めると原因の分類を誤ったまま収集を続けてしまう。
+    if (!(e instanceof HttpError)) throw e;
     // 1 ページには複数の投稿が載るため、欠落数は不明
     console.error(`${index + 1}回目の投稿リスト取得に失敗:`, e);
     failures.pages++;
@@ -358,6 +636,7 @@ function fetchPostList(url: string, index: number, failures: FailureCounts): Pos
  * @param failures 取得できなかった件数の内訳。呼び出し側と共有して加算する
  */
 async function addPostList(
+  session: ApiSession,
   downloadManage: DownloadManage,
   postList: PostListItem[],
   failures: FailureCounts,
@@ -377,8 +656,8 @@ async function addPostList(
       continue;
     }
     // 一覧レスポンスに本文は含まれないため、投稿ごとに post.info を叩く必要がある
-    await DownloadManage.utils.sleep(API_RATE_LIMIT_MS);
-    applyAddResult(addByPostInfo(downloadManage, getPostInfoById(post.id)), failures);
+    // (発行間隔はセッションのゲートが担うので、ここで待たない)
+    applyAddResult(addByPostInfo(downloadManage, await getPostInfoById(session, post.id)), failures);
   }
 }
 
@@ -386,10 +665,10 @@ async function addPostList(
  * 投稿IDからpostInfoを得る
  * @param postId 投稿ID
  */
-function getPostInfoById(postId: string): PostInfo | undefined {
+async function getPostInfoById(session: ApiSession, postId: string): Promise<PostInfo | undefined> {
   const url = `https://api.fanbox.cc/post.info?postId=${postId}`;
   try {
-    const post = DownloadManage.utils.httpGetAs<PostInfoResponse>(url)?.body?.post;
+    const post = (await session.fetchJson<PostInfoResponse>(url))?.body?.post;
     // 形の違いは「取れなかった投稿」ではなく仕様変更とみなす。undefined に丸めると、
     // 全投稿を「支援額不足」と誤報して空の結果を出してしまう。
     // なお閲覧できない投稿も HTTP 200 で投稿オブジェクトを返し、body プロパティは存在したまま
@@ -405,7 +684,9 @@ function getPostInfoById(postId: string): PostInfo | undefined {
     }
     return post;
   } catch (e) {
-    if (e instanceof ApiShapeError) throw e;
+    // 投稿単位の失敗として数えてよいのは HTTP エラーだけ。形状の不一致と枯渇はこの投稿だけの
+    // 問題ではなく、想定外の例外は実装上のバグでありうるので、どちらも呼び出し側へ渡す
+    if (!(e instanceof HttpError)) throw e;
     console.error(`投稿情報の取得に失敗 (postId: ${postId}):`, e);
     return undefined;
   }

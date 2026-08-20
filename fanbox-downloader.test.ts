@@ -11,7 +11,16 @@ import {
   type ImageInfo,
   type UrlEmbedInfo,
 } from 'download-helper/fanbox-collector';
-import { buildFailureMessage, searchBy } from './fanbox-downloader';
+import {
+  ApiSession,
+  buildFailureMessage,
+  HttpError,
+  parseRetryAfterMs,
+  RateLimitExhaustedError,
+  searchBy,
+  TransportExhaustedError,
+  type TransportResult,
+} from './fanbox-downloader';
 
 // convert*Map / DownloadManage の実装本体は download-helper/fanbox-collector.ts に移設済み
 // (詳細なテストは download-helper リポジトリの fanbox-collector.test.ts を参照)。
@@ -208,6 +217,18 @@ describe('buildFailureMessage', () => {
   // 全区分の完全一致で、件数・順序・余分な区分・原因を推測する文言の混入をまとめて固定する
   // (原因を書かないのは、missing-body に CORS・通信断・API 障害・レート制限・仕様変更・
   // 実際の本文欠落が合流しており、件数からは識別できないため)
+  test('レート制限で打ち切ったことを先頭で伝える', () => {
+    const message = buildFailureMessage(counts({ missingBody: 1 }), 'rate-limit-exhausted') ?? '';
+    expect(message.startsWith('レート制限のため途中で打ち切りました')).toBe(true);
+    expect(message).toContain('不完全な結果');
+    expect(message).toContain('確認が必要な未取得');
+  });
+
+  test('失敗件数が 0 でも打ち切りは伝える', () => {
+    const message = buildFailureMessage(counts(), 'transport-exhausted') ?? '';
+    expect(message.startsWith('通信に失敗したため途中で打ち切りました')).toBe(true);
+  });
+
   test('全区分が併存するとき、確認が必要な区分を先に置いて原因は書かない', () => {
     expect(buildFailureMessage(counts({ restricted: 35, missingBody: 10, unsupported: 2, pages: 1 }))).toBe(
       [
@@ -278,20 +299,39 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
   let alerts: string[];
   /** 実際に発行された URL。「叩かないこと」を欠落ではなく記録で確かめるために持つ */
   let requested: string[];
+  let session: ApiSession;
 
+  /** 応答定義から transport を組み、セッションごと差し替える */
   function mockApi(responses: Record<string, unknown>, options: { ignoreFree?: boolean } = {}) {
     alerts = [];
     requested = [];
-    DownloadManage.utils.httpGetAs = ((url: string) => {
+    const transport = async (url: string): Promise<TransportResult> => {
       requested.push(url);
-      if (!(url in responses)) throw new Error(`HTTP 404: ${url}`);
-      return responses[url];
-    }) as typeof DownloadManage.utils.httpGetAs;
-    // レート制限の待機はテストでは不要
-    DownloadManage.utils.sleep = (() => Promise.resolve()) as typeof DownloadManage.utils.sleep;
+      if (!(url in responses)) return { kind: 'response', status: 404, body: '', retryAfter: null };
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url]), retryAfter: null };
+    };
+    // 発行間隔の待機はテストでは不要
+    session = new ApiSession(0, transport, { sleep: async () => {}, now: () => 0 });
     g.alert = (message: string) => alerts.push(message);
     // 「無料コンテンツを省く？」への回答
     g.confirm = () => options.ignoreFree === true;
+    g.prompt = () => null;
+  }
+
+  /** 応答定義ではなく transport そのものを差し替えたいとき用 */
+  function mockApiWithTransport(transport: (url: string) => Promise<TransportResult>) {
+    alerts = [];
+    requested = [];
+    session = new ApiSession(
+      0,
+      async (url) => {
+        requested.push(url);
+        return transport(url);
+      },
+      { sleep: async () => {}, now: () => 0 },
+    );
+    g.alert = (message: string) => alerts.push(message);
+    g.confirm = () => false;
     g.prompt = () => null;
   }
 
@@ -308,7 +348,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
 
   test('新形状のレスポンスから投稿を収集できる', async () => {
     mockApi(baseResponses());
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(result).toBeDefined();
     expect(postCount(result)).toBe(1);
     expect(alerts).toEqual([]);
@@ -321,7 +361,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
   ])('%s が旧形状なら結果を返さない', async (_name, url, oldShape) => {
     mockApi({ ...baseResponses(), [url]: oldShape });
     // 途中まで集めた中身のない結果を成功として出さないこと
-    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    expect(await searchBy(CREATOR_ID, undefined, session)).toBeUndefined();
     // 経路によらず同じ分類の通知になること
     expect(alerts.join()).toContain('仕様が変わった可能性');
   });
@@ -332,13 +372,13 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       [`https://api.fanbox.cc/plan.listCreator?creatorId=${CREATOR_ID}`]: { body: [{ fee: 500, title: 'x' }] },
       [`https://api.fanbox.cc/tag.getFeatured?creatorId=${CREATOR_ID}`]: { body: [{ tag: 'x' }] },
     });
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(1);
   });
 
   test('閲覧できない投稿は post.info を叩かず閲覧制限として数える', async () => {
     mockApi({ ...baseResponses(), [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { isRestricted: true })] } } });
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(0);
     expect(requested).not.toContain(POST_INFO_URL);
     expect(alerts.join()).toContain('閲覧制限により取得できなかった投稿: 1 件');
@@ -353,7 +393,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       },
       { ignoreFree: true },
     );
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(1);
     expect(requested).not.toContain(POST_INFO_URL);
     expect(requested).toContain(postInfoUrl('1002'));
@@ -370,7 +410,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       },
       { ignoreFree: true },
     );
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(0);
     expect(requested).not.toContain(POST_INFO_URL);
     expect(alerts).toEqual([]);
@@ -380,14 +420,14 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     const responses = baseResponses();
     delete responses[POST_INFO_URL];
     mockApi(responses);
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(0);
     expect(alerts.join()).toContain('投稿詳細を取得できないか、本文を利用できなかった投稿: 1 件');
   });
 
   test('post.info は成功しても本文が無い投稿は本文を利用できなかったものとして数える', async () => {
     mockApi({ ...baseResponses(), [POST_INFO_URL]: { body: { post: { ...POST_FULL, body: null } } } });
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(0);
     expect(alerts.join()).toContain('投稿詳細を取得できないか、本文を利用できなかった投稿: 1 件');
   });
@@ -397,7 +437,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       ...baseResponses(),
       [POST_INFO_URL]: { body: { post: { ...POST_FULL, type: 'image-v2', body: { text: 'x' } } } },
     });
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(0);
     expect(alerts.join()).toContain('未対応の投稿形式: 1 件');
   });
@@ -410,7 +450,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       [postInfoUrl('1002')]: { body: { post: fullPost('1002', { body: { text: 123 } }) } },
       [postInfoUrl('1003')]: { body: { post: fullPost('1003') } },
     });
-    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    expect(await searchBy(CREATOR_ID, undefined, session)).toBeUndefined();
     // 中断後の投稿は取得しない
     expect(requested).not.toContain(postInfoUrl('1003'));
     // ページ単位の失敗に丸めない
@@ -420,13 +460,13 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
 
   test('単一投稿モードでも本文の必須フィールド欠落で結果を返さない', async () => {
     mockApi({ ...baseResponses(), [POST_INFO_URL]: { body: { post: { ...POST_FULL, body: { text: 123 } } } } });
-    expect(await searchBy(CREATOR_ID, '1001')).toBeUndefined();
+    expect(await searchBy(CREATOR_ID, '1001', session)).toBeUndefined();
     expect(alerts.join()).toContain('仕様が変わった可能性');
   });
 
   test('単一投稿モードでも post.info が旧形状なら結果を返さない', async () => {
     mockApi({ ...baseResponses(), [POST_INFO_URL]: { body: POST_FULL } });
-    expect(await searchBy(CREATOR_ID, '1001')).toBeUndefined();
+    expect(await searchBy(CREATOR_ID, '1001', session)).toBeUndefined();
     expect(alerts.join()).toContain('仕様が変わった可能性');
   });
 
@@ -439,7 +479,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { isRestricted: true })] } },
       // LIST_PAGE_URL_2 は未定義なので取得に失敗する
     });
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(result).toBeDefined();
     const message = alerts.join();
     expect(message).toContain('閲覧制限のある投稿: 1 件');
@@ -454,7 +494,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { feeRequired: 500 })] } },
       [POST_INFO_URL]: { body: { post: fullPost('1001', { feeRequired: 500, isRestricted: true }) } },
     });
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(0);
     // 事前スキップではなく詳細を叩いた結果として数えていること
     expect(requested).toContain(POST_INFO_URL);
@@ -470,7 +510,7 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       },
       { ignoreFree: true },
     );
-    const result = await searchBy(CREATOR_ID, undefined);
+    const result = await searchBy(CREATOR_ID, undefined, session);
     expect(postCount(result)).toBe(0);
     expect(requested).toContain(POST_INFO_URL);
     // 意図的な除外は失敗ではない
@@ -478,12 +518,69 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
   });
 
   test('投稿単位の想定外の例外はページの失敗に数えず中止する', async () => {
-    mockApi({ ...baseResponses(), [LIST_PAGE_URL]: { body: { posts: [listItem('1001')] } } });
-    // 投稿ごとの待機で失敗させ、一覧の取得ではなく投稿処理で例外が出る状況を作る
-    DownloadManage.utils.sleep = (() => Promise.reject(new Error('boom'))) as typeof DownloadManage.utils.sleep;
-    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    // transport が契約どおり unobservable-failure を返さず例外を投げた場合。
+    // 実装上のバグでありうるので、投稿単位の失敗に丸めず中止する
+    const responses = baseResponses();
+    mockApiWithTransport(async (url) => {
+      if (url === POST_INFO_URL) throw new Error('boom');
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url] ?? null), retryAfter: null };
+    });
+    expect(await searchBy(CREATOR_ID, undefined, session)).toBeUndefined();
     expect(alerts.join()).toContain('予期しないエラー');
     expect(alerts.join()).not.toContain('ページ');
+  });
+
+  test('一覧取得の想定外の例外もページの失敗に数えず中止する', async () => {
+    const responses = baseResponses();
+    mockApiWithTransport(async (url) => {
+      if (url === LIST_PAGE_URL) throw new Error('boom');
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url] ?? null), retryAfter: null };
+    });
+    expect(await searchBy(CREATOR_ID, undefined, session)).toBeUndefined();
+    expect(alerts.join()).toContain('予期しないエラー');
+    expect(alerts.join()).not.toContain('ページ');
+  });
+
+  test('収集の途中で再試行枠を使い切ったら、集めた分を不完全と明示して返す', async () => {
+    const responses = baseResponses();
+    responses[LIST_PAGE_URL] = { body: { posts: [listItem('1001'), listItem('1002')] } };
+    responses[postInfoUrl('1002')] = { body: { post: fullPost('1002') } };
+    mockApiWithTransport(async (url) => {
+      // 2 件目の投稿詳細だけが最後まで観測できない
+      if (url === postInfoUrl('1002')) return { kind: 'unobservable-failure' };
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url] ?? null), retryAfter: null };
+    });
+    const result = await searchBy(CREATOR_ID, undefined, session);
+    // 集めた分は捨てない
+    expect(postCount(result)).toBe(1);
+    expect(alerts.join()).toContain('通信に失敗したため途中で打ち切りました');
+    expect(alerts.join()).toContain('不完全な結果');
+  });
+
+  test('枯渇後は次の投稿を要求しない', async () => {
+    const responses = baseResponses();
+    responses[LIST_PAGE_URL] = { body: { posts: [listItem('1001'), listItem('1002')] } };
+    responses[postInfoUrl('1002')] = { body: { post: fullPost('1002') } };
+    mockApiWithTransport(async (url) => {
+      if (url === POST_INFO_URL) return { kind: 'unobservable-failure' };
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url] ?? null), retryAfter: null };
+    });
+    await searchBy(CREATOR_ID, undefined, session);
+    // 1 件目で枯渇したので 2 件目は叩かない
+    expect(requested).not.toContain(postInfoUrl('1002'));
+  });
+
+  test('プラン情報の取得で枯渇したら収集に進まない', async () => {
+    const responses = baseResponses();
+    const planUrl = `https://api.fanbox.cc/plan.listCreator?creatorId=${CREATOR_ID}`;
+    mockApiWithTransport(async (url) => {
+      if (url === planUrl) return { kind: 'unobservable-failure' };
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url] ?? null), retryAfter: null };
+    });
+    expect(await searchBy(CREATOR_ID, undefined, session)).toBeUndefined();
+    expect(alerts.join()).toContain('通信に失敗したため途中で打ち切りました');
+    // 既に上限まで待った直後に別のエンドポイントへ要求を出さない
+    expect(requested.some((u) => u.includes('post.paginateCreator'))).toBe(false);
   });
 
   test('feeRequired が number でない一覧要素は形状の不一致として中断する', async () => {
@@ -491,8 +588,182 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
       ...baseResponses(),
       [LIST_PAGE_URL]: { body: { posts: [{ id: '1001', isRestricted: false, feeRequired: '0' }] } },
     });
-    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    expect(await searchBy(CREATOR_ID, undefined, session)).toBeUndefined();
     expect(requested).not.toContain(POST_INFO_URL);
     expect(alerts.join()).toContain('仕様が変わった可能性');
+  });
+});
+
+describe('parseRetryAfterMs', () => {
+  const NOW = Date.parse('2026-08-21T00:00:00Z');
+
+  test.each([
+    ['秒数', '30', 30_000],
+    ['秒数の 0', '0', 0],
+    ['前後の空白を無視する', '  7  ', 7_000],
+  ])('%s を待機ミリ秒に変換する', (_name, value, expected) => {
+    expect(parseRetryAfterMs(value as string, NOW)).toBe(expected as number);
+  });
+
+  test('HTTP-date は現在時刻との差になる', () => {
+    expect(parseRetryAfterMs('Fri, 21 Aug 2026 00:00:20 GMT', NOW)).toBe(20_000);
+  });
+
+  test('過去の HTTP-date は 0 に切り上げる', () => {
+    expect(parseRetryAfterMs('Thu, 20 Aug 2026 00:00:00 GMT', NOW)).toBe(0);
+  });
+
+  test.each([
+    ['null', null],
+    ['空文字', ''],
+    ['空白のみ', '   '],
+    ['解釈できない文字列', 'soon'],
+    ['負の秒数', '-5'],
+  ])('%s は undefined になる (固定バックオフへ落とす)', (_name, value) => {
+    expect(parseRetryAfterMs(value as string | null, NOW)).toBeUndefined();
+  });
+});
+
+describe('ApiSession - transport 契約と再試行ポリシー', () => {
+  const URL = 'https://api.fanbox.cc/post.info?postId=1';
+
+  /** 決定的に検証するため sleep と now を注入する。sleep は待機時間を記録するだけ */
+  const createHarness = (results: TransportResult[], baseInterval = 500) => {
+    const waits: number[] = [];
+    const requested: string[] = [];
+    let clock = 1_000_000;
+    const queue = [...results];
+    const transport = async (url: string): Promise<TransportResult> => {
+      requested.push(url);
+      const next = queue.shift();
+      if (!next) throw new Error('transport の応答が足りない');
+      return next;
+    };
+    const session = new ApiSession(baseInterval, transport, {
+      sleep: async (ms) => {
+        waits.push(ms);
+        clock += ms;
+      },
+      now: () => clock,
+    });
+    return {
+      session,
+      waits,
+      requested,
+      advance: (ms: number) => {
+        clock += ms;
+      },
+    };
+  };
+
+  const ok = (body: string): TransportResult => ({ kind: 'response', status: 200, body, retryAfter: null });
+  const tooMany = (retryAfter: string | null = null): TransportResult => ({
+    kind: 'response',
+    status: 429,
+    body: '',
+    retryAfter,
+  });
+  const failure = (): TransportResult => ({ kind: 'unobservable-failure' });
+
+  test('200 なら JSON を返し、待機は発行間隔のみ', async () => {
+    const h = createHarness([ok('{"a":1}')]);
+    expect(await h.session.fetchJson<{ a: number }>(URL)).toEqual({ a: 1 });
+    expect(h.requested).toHaveLength(1);
+    expect(h.waits).toEqual([]);
+  });
+
+  test('429 は 5 / 15 / 45 秒で 3 回再試行し、枯渇したら RateLimitExhaustedError', async () => {
+    const h = createHarness([tooMany(), tooMany(), tooMany(), tooMany()]);
+    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(RateLimitExhaustedError);
+    expect(h.requested).toHaveLength(4);
+    expect(h.waits.filter((w) => w >= 5_000)).toEqual([5_000, 15_000, 45_000]);
+  });
+
+  test('読める Retry-After は固定バックオフより優先する', async () => {
+    const h = createHarness([tooMany('30'), ok('{}')]);
+    await h.session.fetchJson(URL);
+    expect(h.waits).toContain(30_000);
+    expect(h.waits).not.toContain(5_000);
+  });
+
+  test('Retry-After が不正なら固定バックオフへ落とす', async () => {
+    const h = createHarness([tooMany('soon'), ok('{}')]);
+    await h.session.fetchJson(URL);
+    expect(h.waits).toContain(5_000);
+  });
+
+  test('観測できない失敗は 5 / 15 秒の 2 回だけ再試行し、枯渇したら TransportExhaustedError', async () => {
+    const h = createHarness([failure(), failure(), failure()]);
+    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(TransportExhaustedError);
+    // 429 と違い 45 秒は待たない
+    expect(h.requested).toHaveLength(3);
+    expect(h.waits.filter((w) => w >= 5_000)).toEqual([5_000, 15_000]);
+  });
+
+  test('観測できない失敗から復帰できる', async () => {
+    const h = createHarness([failure(), ok('{"ok":true}')]);
+    expect(await h.session.fetchJson<{ ok: boolean }>(URL)).toEqual({ ok: true });
+    expect(h.requested).toHaveLength(2);
+  });
+
+  test('2xx 以外は再試行せず HttpError になる', async () => {
+    const h = createHarness([{ kind: 'response', status: 404, body: '', retryAfter: null }]);
+    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(HttpError);
+    expect(h.requested).toHaveLength(1);
+  });
+
+  test('JSON として読めない本文は形状の問題として扱い、再試行しない', async () => {
+    const h = createHarness([ok('<html>')]);
+    await expect(h.session.fetchJson(URL)).rejects.toThrow('API レスポンスの形状が想定外');
+    expect(h.requested).toHaveLength(1);
+  });
+
+  test('exact 429 でだけ発行間隔が上がる', async () => {
+    const h = createHarness([tooMany(), ok('{}')]);
+    expect(h.session.intervalMs).toBe(500);
+    await h.session.fetchJson(URL);
+    expect(h.session.intervalMs).toBe(750);
+  });
+
+  test('観測できない失敗では発行間隔を上げない (通信障害をレート制限として学習しない)', async () => {
+    const h = createHarness([failure(), failure(), ok('{}')]);
+    await h.session.fetchJson(URL);
+    expect(h.session.intervalMs).toBe(500);
+  });
+
+  test('発行間隔の引き上げには上限がある', async () => {
+    const h = createHarness([tooMany(), tooMany(), tooMany(), ok('{}')], 2_000);
+    await h.session.fetchJson(URL);
+    // cap は max(baseInterval, 3000)
+    expect(h.session.intervalMs).toBe(3_000);
+  });
+
+  test('同時に呼んでも直列化される', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const transport = async (): Promise<TransportResult> => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await Promise.resolve();
+      inFlight--;
+      return { kind: 'response', status: 200, body: '{}', retryAfter: null };
+    };
+    const session = new ApiSession(0, transport, { sleep: async () => {}, now: () => 0 });
+    await Promise.all([session.fetchJson(URL), session.fetchJson(URL), session.fetchJson(URL)]);
+    expect(maxInFlight).toBe(1);
+  });
+
+  test('直列化は失敗した呼び出しの後も続く', async () => {
+    const h = createHarness([{ kind: 'response', status: 404, body: '', retryAfter: null }, ok('{"n":2}')]);
+    await expect(h.session.fetchJson(URL)).rejects.toBeInstanceOf(HttpError);
+    expect(await h.session.fetchJson<{ n: number }>(URL)).toEqual({ n: 2 });
+  });
+
+  test('中断済みの signal では要求を出さない', async () => {
+    const h = createHarness([ok('{}')]);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(h.session.fetchJson(URL, controller.signal)).rejects.toBeDefined();
+    expect(h.requested).toHaveLength(0);
   });
 });
