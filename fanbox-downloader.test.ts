@@ -301,7 +301,8 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     mockApi({ ...baseResponses(), [url]: oldShape });
     // 途中まで集めた中身のない結果を成功として出さないこと
     expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
-    expect(alerts.length).toBeGreaterThan(0);
+    // 経路によらず同じ分類の通知になること
+    expect(alerts.join()).toContain('仕様が変わった可能性');
   });
 
   test('plan / tag が旧形状でも収集は続く (表示の補助でしかないため)', async () => {
@@ -408,6 +409,45 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     expect(message).toContain('閲覧制限のある投稿: 1 件');
     expect(message).toContain('1 ページ');
     expect(message).not.toContain('2 件');
+  });
+
+  test('一覧では閲覧できても詳細で閲覧制限なら閲覧制限として数える', async () => {
+    // 一覧取得後に権限が変わる場合の防御。一覧側の事前スキップでは拾えない経路
+    mockApi({
+      ...baseResponses(),
+      [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { feeRequired: 500 })] } },
+      [POST_INFO_URL]: { body: { post: fullPost('1001', { feeRequired: 500, isRestricted: true }) } },
+    });
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(postCount(result)).toBe(0);
+    // 事前スキップではなく詳細を叩いた結果として数えていること
+    expect(requested).toContain(POST_INFO_URL);
+    expect(alerts.join()).toContain('閲覧制限により取得できなかった投稿: 1 件');
+  });
+
+  test('一覧では有料でも詳細が無料なら、無料を省く設定で失敗に数えない', async () => {
+    mockApi(
+      {
+        ...baseResponses(),
+        [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { feeRequired: 500 })] } },
+        [POST_INFO_URL]: { body: { post: fullPost('1001', { feeRequired: 0 }) } },
+      },
+      { ignoreFree: true },
+    );
+    const result = await searchBy(CREATOR_ID, undefined);
+    expect(postCount(result)).toBe(0);
+    expect(requested).toContain(POST_INFO_URL);
+    // 意図的な除外は失敗ではない
+    expect(alerts).toEqual([]);
+  });
+
+  test('投稿単位の想定外の例外はページの失敗に数えず中止する', async () => {
+    mockApi({ ...baseResponses(), [LIST_PAGE_URL]: { body: { posts: [listItem('1001')] } } });
+    // 投稿ごとの待機で失敗させ、一覧の取得ではなく投稿処理で例外が出る状況を作る
+    DownloadManage.utils.sleep = (() => Promise.reject(new Error('boom'))) as typeof DownloadManage.utils.sleep;
+    expect(await searchBy(CREATOR_ID, undefined)).toBeUndefined();
+    expect(alerts.join()).toContain('予期しないエラー');
+    expect(alerts.join()).not.toContain('ページ');
   });
 
   test('feeRequired が number でない一覧要素は形状の不一致として中断する', async () => {

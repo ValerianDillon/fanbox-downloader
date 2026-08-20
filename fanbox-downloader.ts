@@ -66,10 +66,27 @@ class PostBodyInvalidError extends Error {
 }
 
 const ABORT_MESSAGE = 'FANBOX API の仕様が変わった可能性があります。取得を中止しました';
+const UNEXPECTED_ABORT_MESSAGE = '予期しないエラーが発生したため取得を中止しました (詳細はコンソール)';
 
 /** 投稿単位の失敗に丸めず、結果自体を返さずに中断すべきエラーか */
 function isCollectionAbortError(error: unknown): error is ApiShapeError | PostBodyInvalidError {
   return error instanceof ApiShapeError || error instanceof PostBodyInvalidError;
+}
+
+/**
+ * 収集を中止して結果を返さないことを通知する。
+ * 想定外の例外も投稿単位・ページ単位の失敗に丸めず中止する: どこまで取り込めたか分からない
+ * 状態で結果を出すと、欠けた ZIP を成功として渡してしまう。
+ */
+function abortCollection(error: unknown): undefined {
+  if (isCollectionAbortError(error)) {
+    console.error('取得を中止:', error);
+    alert(ABORT_MESSAGE);
+  } else {
+    console.error('予期しないエラーで取得を中止:', error);
+    alert(UNEXPECTED_ABORT_MESSAGE);
+  }
+  return undefined;
 }
 
 /**
@@ -84,11 +101,21 @@ function applyAddResult(result: AddPostResult, counts: FailureCounts): void {
     case 'ignored':
       return;
     case 'unavailable':
-      // missing-body には通信失敗や CORS も合流する (getPostInfoById がそれらを undefined に
-      // 丸め、addByPostInfo は理由を区別できないため)
-      if (result.reason === 'restricted') counts.restricted++;
-      else counts.missingBody++;
-      return;
+      switch (result.reason) {
+        case 'restricted':
+          counts.restricted++;
+          return;
+        case 'missing-body':
+          // missing-body には通信失敗や CORS も合流する (getPostInfoById がそれらを undefined
+          // に丸め、addByPostInfo は理由を区別できないため)
+          counts.missingBody++;
+          return;
+        default: {
+          // reason が増えたときに型検査で気付けるようにする
+          const exhaustiveReason: never = result.reason;
+          throw new Error(`未知の unavailable reason: ${JSON.stringify(exhaustiveReason)}`);
+        }
+      }
     case 'unsupported':
       counts.unsupported++;
       return;
@@ -231,11 +258,8 @@ export async function searchBy(
     try {
       applyAddResult(addByPostInfo(downloadSettings, getPostInfoById(postId)), failures);
     } catch (e) {
-      // 一覧モードと同じく、形状の不一致は投稿単位の失敗に丸めず結果自体を返さない
-      if (!isCollectionAbortError(e)) throw e;
-      console.error('投稿の形状が想定外:', e);
-      alert(ABORT_MESSAGE);
-      return;
+      // 一覧モードと同じく、中止すべき失敗は投稿単位の失敗に丸めず結果自体を返さない
+      return abortCollection(e);
     }
   } else {
     const collected = await getItemsById(downloadSettings);
@@ -272,6 +296,8 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
       (item) => typeof item === 'string',
     );
   } catch (e) {
+    // 形状の不一致はページ取得の失敗ではなく仕様変更なので、他の経路と同じ文言で中止する
+    if (isCollectionAbortError(e)) return abortCollection(e);
     console.error('投稿一覧の取得に失敗:', e);
     alert('投稿一覧の取得に失敗しました');
     return undefined;
@@ -280,18 +306,13 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
   for (let i = 0; i < urls.length; i++) {
     console.log(`${i + 1}回目`);
     try {
-      await addByPostListUrl(downloadManage, urls[i], failures);
+      // ページ単位の失敗として数えてよいのは一覧の取得・検証で出た例外だけなので、
+      // 投稿単位の処理とは try を分ける。まとめて囲むと投稿側の想定外の例外まで
+      // 「ページが 1 枚落ちた」ことにされ、原因の分類を誤る。
+      const postList = fetchPostList(urls[i], i, failures);
+      if (postList) await addPostList(downloadManage, postList, failures);
     } catch (e) {
-      // 形状の不一致は「このページだけ落ちた」ではなく API 仕様変更なので、
-      // 読み飛ばすと中身のない結果を成功として出してしまう
-      if (isCollectionAbortError(e)) {
-        console.error('取得を中止:', e);
-        alert(ABORT_MESSAGE);
-        return undefined;
-      }
-      // 1 ページには複数の投稿が載るため、欠落数は不明
-      console.error(`${i + 1}回目の投稿リスト取得に失敗:`, e);
-      failures.pages++;
+      return abortCollection(e);
     }
     await DownloadManage.utils.sleep(API_RATE_LIMIT_MS);
   }
@@ -299,16 +320,15 @@ async function getItemsById(downloadManage: DownloadManage): Promise<FailureCoun
 }
 
 /**
- * 投稿リストURLからURLリストに追加
- * @param downloadManage ダウンロード設定
- * @param url
+ * 投稿一覧ページを取得して検証する。取得できなければページ単位の失敗として数え undefined を返す。
+ * 形状の不一致だけは仕様変更なので、中止させるために呼び出し側へ投げる。
+ * @param url 投稿一覧ページのURL
+ * @param index 何ページ目か (ログ用の 0 始まり)
  * @param failures 取得できなかった件数の内訳。呼び出し側と共有して加算する
  */
-async function addByPostListUrl(downloadManage: DownloadManage, url: string, failures: FailureCounts): Promise<void> {
-  const postList = unwrapArray<PostListItem>(
-    DownloadManage.utils.httpGetAs<PostList>(url)?.body?.posts,
-    url,
-    (item) => {
+function fetchPostList(url: string, index: number, failures: FailureCounts): PostListItem[] | undefined {
+  try {
+    return unwrapArray<PostListItem>(DownloadManage.utils.httpGetAs<PostList>(url)?.body?.posts, url, (item) => {
       const post = item as PostListItem | null;
       // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
       return (
@@ -317,8 +337,27 @@ async function addByPostListUrl(downloadManage: DownloadManage, url: string, fai
         typeof post.isRestricted === 'boolean' &&
         typeof post.feeRequired === 'number'
       );
-    },
-  );
+    });
+  } catch (e) {
+    if (isCollectionAbortError(e)) throw e;
+    // 1 ページには複数の投稿が載るため、欠落数は不明
+    console.error(`${index + 1}回目の投稿リスト取得に失敗:`, e);
+    failures.pages++;
+    return undefined;
+  }
+}
+
+/**
+ * 投稿一覧の各投稿をURLリストに追加
+ * @param downloadManage ダウンロード設定
+ * @param postList 投稿一覧
+ * @param failures 取得できなかった件数の内訳。呼び出し側と共有して加算する
+ */
+async function addPostList(
+  downloadManage: DownloadManage,
+  postList: PostListItem[],
+  failures: FailureCounts,
+): Promise<void> {
   console.log(`投稿の数:${postList.length}`);
   for (const post of postList) {
     if (!downloadManage.isLimitValid()) break;
