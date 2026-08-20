@@ -564,8 +564,10 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     const result = await searchBy(CREATOR_ID, undefined, session);
     // 集めた分は捨てない
     expect(postCount(result)).toBe(1);
+    // 収集側から件数と停止位置が伝わること (手入力ではなく実際の収集結果で確かめる)
     expect(alerts.join()).toContain('通信に失敗したため途中で打ち切りました');
-    expect(alerts.join()).toContain('不完全な結果');
+    expect(alerts.join()).toContain('ここまでに取り込めた投稿: 1 件');
+    expect(alerts.join()).toContain('1 ページ目で停止');
   });
 
   test('枯渇後は次の投稿を要求しない', async () => {
@@ -579,6 +581,27 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     await searchBy(CREATOR_ID, undefined, session);
     // 1 件目で枯渇したので 2 件目は叩かない
     expect(requested).not.toContain(postInfoUrl('1002'));
+  });
+
+  test('取得上限に達したら残りの一覧ページを要求しない', async () => {
+    const responses = baseResponses();
+    responses[`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`] = {
+      body: { pageUrls: [LIST_PAGE_URL, LIST_PAGE_URL_2] },
+    };
+    responses[LIST_PAGE_URL_2] = { body: { posts: [] } };
+    mockApiWithTransport(async (url) => ({
+      kind: 'response',
+      status: 200,
+      body: JSON.stringify(responses[url] ?? null),
+      retryAfter: null,
+    }));
+    // 「取得制限数を入力」に 1 を返す
+    g.prompt = () => '1';
+    await searchBy(CREATOR_ID, undefined, session);
+    expect(requested).toContain(LIST_PAGE_URL);
+    expect(requested).not.toContain(LIST_PAGE_URL_2);
+    // 完了しているので打ち切りとして通知しない
+    expect(alerts.join()).not.toContain('打ち切りました');
   });
 
   test('プラン情報の取得で枯渇したら収集に進まない', async () => {
@@ -630,6 +653,10 @@ describe('parseRetryAfterMs', () => {
     ['空白のみ', '   '],
     ['解釈できない文字列', 'soon'],
     ['負の秒数', '-5'],
+    ['HTTP-date ではない日付表記', '1 Jan 2027'],
+    ['英語の日付表記', 'August 21, 2026'],
+    ['指数表記', '1e-3'],
+    ['16 進表記', '0x10'],
   ])('%s は undefined になる (固定バックオフへ落とす)', (_name, value) => {
     expect(parseRetryAfterMs(value as string | null, NOW)).toBeUndefined();
   });

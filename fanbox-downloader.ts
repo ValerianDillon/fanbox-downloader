@@ -273,7 +273,11 @@ const THROTTLE_CAP_FLOOR_MS = 3_000;
 const DECAY_SUCCESS_STREAK = 20;
 const DECAY_QUIET_MS = 60_000;
 
-/** Retry-After を待機ミリ秒へ変換する。秒数形式と HTTP-date 形式を受け、不正値は undefined */
+/** RFC 9110 の IMF-fixdate。例: Sun, 06 Nov 1994 08:49:37 GMT */
+const IMF_FIXDATE =
+  /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/** Retry-After を待機ミリ秒へ変換する。秒数形式と IMF-fixdate を受け、それ以外は undefined */
 export function parseRetryAfterMs(value: string | null, nowMs: number): number | undefined {
   if (!value) return undefined;
   const trimmed = value.trim();
@@ -284,9 +288,10 @@ export function parseRetryAfterMs(value: string | null, nowMs: number): number |
     const ms = Number(trimmed) * 1000;
     return Number.isFinite(ms) ? ms : undefined;
   }
-  // HTTP-date (IMF-fixdate) は必ず曜日名と月名を含む。英字を含まない値を Date.parse に
-  // 渡すと '-5' のような不正値まで解釈されてしまう
-  if (!/[A-Za-z]/.test(trimmed)) return undefined;
+  // RFC 9110 が送信側に要求する IMF-fixdate だけを受ける。Date.parse に緩く渡すと
+  // '1 Jan 2027' のような HTTP-date ではない値まで待機時間になってしまう。
+  // obsolete 形式は固定バックオフへ落とす (待機時間の推定を誤るより安全側)
+  if (!IMF_FIXDATE.test(trimmed)) return undefined;
   const at = Date.parse(trimmed);
   if (Number.isNaN(at)) return undefined;
   return Math.max(0, at - nowMs);
@@ -648,6 +653,10 @@ async function getItemsById(session: ApiSession, downloadManage: DownloadManage)
   // 打ち切ったときに「何件まで取れたか」を示すため、途中経過を共有の入れ物で持つ
   const progress = { addedPostCount: 0 };
   for (let i = 0; i < urls.length; i++) {
+    // 取得上限に達したら一覧ページも要求しない。要求された範囲は完了しているので、
+    // ここで止めるのは打ち切りではない (残りを叩き続けると無駄な負荷になるうえ、
+    // そこで枯渇すると完了しているのに「不完全」と誤って伝えることになる)
+    if (!downloadManage.isLimitValid()) break;
     console.log(`${i + 1}回目`);
     try {
       // ページ単位の失敗として数えてよいのは一覧の取得・検証で出た例外だけなので、
