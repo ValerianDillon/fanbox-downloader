@@ -222,8 +222,9 @@ export const pageOriginTransport: Transport = async (url, _signal) => {
   try {
     xhr.send(null);
   } catch (cause) {
-    // 通信と CORS の失敗は DOMException として上がる。それ以外は想定外なので丸めない
-    if (!(cause instanceof DOMException)) throw cause;
+    // 同期 XHR の通信失敗は NetworkError として規定されている。DOMException でも
+    // InvalidStateError などは状態違反であって通信障害ではないので丸めない
+    if (!(cause instanceof DOMException) || cause.name !== 'NetworkError') throw cause;
     // 応答を観測できていないので status は推測しない
     return { kind: 'unobservable-failure', cause };
   }
@@ -298,6 +299,9 @@ export function parseRetryAfterMs(value: string | null, nowMs: number): number |
   if (!IMF_FIXDATE.test(trimmed)) return undefined;
   const at = Date.parse(trimmed);
   if (Number.isNaN(at)) return undefined;
+  // 字面の検証だけでは '31 Sep' のような存在しない日付や、曜日の食い違い、24:00:00 を弾けない。
+  // Date.parse はそれらを正規化してしまうので、正規化結果が元の表記と一致するか確かめる
+  if (new Date(at).toUTCString() !== trimmed) return undefined;
   return Math.max(0, at - nowMs);
 }
 

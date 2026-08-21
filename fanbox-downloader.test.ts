@@ -657,6 +657,9 @@ describe('parseRetryAfterMs', () => {
     ['英語の日付表記', 'August 21, 2026'],
     ['指数表記', '1e-3'],
     ['16 進表記', '0x10'],
+    ['存在しない日付', 'Thu, 31 Sep 2026 00:00:00 GMT'],
+    ['曜日が食い違う日付', 'Mon, 21 Aug 2026 00:00:00 GMT'],
+    ['24 時表記', 'Fri, 21 Aug 2026 24:00:00 GMT'],
   ])('%s は undefined になる (固定バックオフへ落とす)', (_name, value) => {
     expect(parseRetryAfterMs(value as string | null, NOW)).toBeUndefined();
   });
@@ -740,9 +743,14 @@ describe('pageOriginTransport', () => {
   });
 
   test('send の想定外の例外は通信障害に丸めない', async () => {
-    // 通信・CORS の失敗は DOMException として上がる。それ以外は実装上のバグでありうる
+    // 通信の失敗は NetworkError として規定されている。それ以外は実装上のバグでありうる
     stubXhr({ throwOnSend: new TypeError('想定外') });
     await expect(pageOriginTransport('https://api.fanbox.cc/x')).rejects.toBeInstanceOf(TypeError);
+  });
+
+  test('DOMException でも状態違反は通信障害に丸めない', async () => {
+    stubXhr({ throwOnSend: new DOMException('not opened', 'InvalidStateError') });
+    await expect(pageOriginTransport('https://api.fanbox.cc/x')).rejects.toBeInstanceOf(DOMException);
   });
 
   test('URL の構文エラーは通信障害に丸めない', async () => {
@@ -983,13 +991,25 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
       },
       { sleep: async () => {}, now: () => 0 },
     );
-    const pending = session.fetchJson<unknown, unknown>(URL, (j) => j, controller.signal);
+    let validated = 0;
+    const pending = session.fetchJson<unknown, unknown>(
+      URL,
+      (j) => {
+        validated++;
+        return j;
+      },
+      controller.signal,
+    );
     await inTransport;
     controller.abort();
     release({ kind: 'response', status: 200, body: '{}', retryAfter: null });
     await expect(pending).rejects.toBeDefined();
     // 中断後に追加の要求を出さない
     expect(calls).toBe(1);
+    // 返却 Promise の reject だけでなく、応答の処理自体が行われないこと。
+    // ここを見ないと発行後の中断検査を外しても通ってしまう
+    await Promise.resolve();
+    expect(validated).toBe(0);
   });
 
   test('キュー待ちのまま中断できる (先行要求が止まっていても伝わる)', async () => {
