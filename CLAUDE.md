@@ -73,7 +73,8 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
 
 ## Git運用
 
-- fork なので `upstream` (furubarug/fanbox-downloader) が残してある。上流の変更取り込み用
-- **`gh` の既定リポジトリは `gh repo set-default ValerianDillon/fanbox-downloader` で固定してある** (git config の `remote.origin.gh-resolved=base`)。upstream remote があるため、未設定だと `gh issue` / `gh pr` が読み書きとも fork 元 (他人のリポジトリ) へ解決される。クローンし直したら再設定すること
-  - 既定ブランチは `master` なので `gh pr create` の `--base` は省略してよい (`--base main` は download-helper 側の慣習で、ここでは失敗する)
+- fork だが上流 (furubarug/fanbox-downloader) の変更を取り込む予定はないので、`upstream` remote は置かない。remote は `origin` だけにする
+  - `upstream` remote があると `gh` の既定リポジトリが fork 元へ解決され、`gh issue list` / `gh issue view` が他人のリポジトリの Issue を返す。書き込み (コメント・クローズ) の誤爆につながるため、必要になったときも remote は足さず URL 直指定で fetch する
+  - 併せて `gh repo set-default ValerianDillon/fanbox-downloader` を設定してある (git config の `remote.origin.gh-resolved=base`)。クローンし直したら再設定すること
+- 既定ブランチは `master`。`gh pr create` の `--base` は省略してよい (`--base main` は download-helper 側の慣習で、ここでは失敗する)
 - マージは squash。`master` の履歴は `<タイトル> (#21)` の形の単一コミットで揃える
