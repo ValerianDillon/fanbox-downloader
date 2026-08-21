@@ -12,33 +12,15 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
 
 ## プロジェクト構成
 
-```
-fanbox-downloader.ts    # メインソース（エントリポイント、export main()）
-biome.json              # Biome 設定
-.mise.toml              # mise ツールバージョン管理
-docs/
-  fanbox-downloader.min.js  # ビルド成果物（CI で自動生成、git 管理対象外）
-  index.html                # GitHub Pages ランディングページ
-  sitemap.xml
-.github/
-  workflows/
-    deploy-pages.yml            # master push 時にビルド + Pages デプロイ
-    check-download-helper.yml   # 週1回 download-helper の更新を検出して PR 作成
-  dependabot.yml                # GitHub Actions の自動更新
-```
-
-- 単一ファイル構成のブックマークレット
-- ビルド成果物 `docs/fanbox-downloader.min.js` は CI で自動生成されるため git 管理対象外
-- FANBOX API の型定義・`DownloadManage`・`addByPostInfo`・`convert*Map` は
-  `download-helper/fanbox-collector`（download-helper パッケージ内、v4.2.0〜）に集約されており、
-  このリポジトリにはローカルの型定義ファイルは存在しない（`fanbox-downloader-extension` と共用）
+- `fanbox-downloader.ts` の単一ファイル構成 (エントリポイントは `export main()`)
+- ビルド成果物 `docs/fanbox-downloader.min.js` は CI が生成するため git 管理対象外。ローカルで `bun run build` しても commit には現れない
+- FANBOX API の型定義と収集ロジックは `download-helper/fanbox-collector` にあり、このリポジトリにローカルの型定義ファイルは無い (`fanbox-downloader-extension` と共用)
 
 ## 技術スタック
 
-- Bun でバンドル + ミニファイ（TypeScript → ESM）
-- Biome で静的解析・フォーマット
-- tsconfig.json はエディタの型チェック用に維持
-- 唯一の runtime 依存: `download-helper`（GitHub の git tag `vX.X.X` から取得）
+- Bun でバンドル + ミニファイ (TypeScript → ESM)、Biome で静的解析・フォーマット
+- tsconfig.json はビルドには使わず、エディタの型チェック用に維持している
+- 唯一の runtime 依存は `download-helper` (GitHub の git tag から取得。バージョンは package.json が SoT)
 
 ## アーキテクチャ
 
@@ -78,17 +60,14 @@ docs/
     `PostBodyInvalidError` で収集全体を中断する。`ApiShapeError` とは検出層が違うので型は分け、
     捕捉は `isCollectionAbortError` にまとめる
 - 中断の扱いは一覧モードと単一投稿モードで揃える (どちらも同じ alert を出して結果を返さない)
+- 失敗種別の判定 (握りつぶして続行するか、収集を止めるか) は名前の付いた述語に集約する (`isCollectionAbortError` など)。catch に `instanceof` の型リストを直書きすると、共有層でエラー型が増えたり分かれたりしたときに一部の catch だけ取り残される
 
 ## コーディング規約
 
-- Biome (recommended ルールセット) で強制。設定は `biome.json` に記載
-- インデント: スペース2つ
-- シングルクォート、セミコロンあり、末尾カンマあり
-- `lineWidth: 120`
+- Biome (recommended ルールセット) で強制。設定は `biome.json` が SoT
 
 ## Git運用
 
-- リモート `origin`: ValerianDillon/fanbox-downloader
-- リモート `upstream`: furubarug/fanbox-downloader（上流の変更取り込み用に維持）
-- コミットの author/committer は ValerianDillon であること
+- fork なので `upstream` (furubarug/fanbox-downloader) が残してある。上流の変更取り込み用
 - **`gh pr create` は fork 元 (upstream) をデフォルトのベースリポジトリにする。** 必ず `--repo ValerianDillon/fanbox-downloader --base master` を指定すること
+- マージは squash。`master` の履歴は `<タイトル> (#21)` の形の単一コミットで揃える
