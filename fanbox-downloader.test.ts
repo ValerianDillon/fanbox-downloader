@@ -379,6 +379,23 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     expect(postCount(result)).toBe(1);
   });
 
+  test('plan / tag が JSON として読めなくても収集は続く (表示の補助でしかないため)', async () => {
+    // 投稿一覧・投稿詳細では同じ ResponseParseError で収集を止める。plan / tag だけが例外で、
+    // ここを中断に倒すと tag の応答が壊れただけで ZIP が一切作られなくなる
+    const planUrl = `https://api.fanbox.cc/plan.listCreator?creatorId=${CREATOR_ID}`;
+    const tagUrl = `https://api.fanbox.cc/tag.getFeatured?creatorId=${CREATOR_ID}`;
+    const responses = baseResponses();
+    mockApiWithTransport(async (url) => ({
+      kind: 'response',
+      status: 200,
+      body: url === planUrl || url === tagUrl ? '<html>' : JSON.stringify(responses[url] ?? null),
+      retryAfter: null,
+    }));
+    const result = await searchBy(CREATOR_ID, undefined, session);
+    expect(postCount(result)).toBe(1);
+    expect(alerts.join()).not.toContain('仕様が変わった可能性');
+  });
+
   test('閲覧できない投稿は post.info を叩かず閲覧制限として数える', async () => {
     mockApi({ ...baseResponses(), [LIST_PAGE_URL]: { body: { posts: [listItem('1001', { isRestricted: true })] } } });
     const result = await searchBy(CREATOR_ID, undefined, session);
