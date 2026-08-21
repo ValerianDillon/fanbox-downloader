@@ -5,7 +5,6 @@ import {
   ResponseParseError,
   type Transport,
   TransportExhaustedError,
-  type TransportResult,
 } from 'download-helper/api-session';
 import { DownloadHelper, type DownloadObject } from 'download-helper/download-helper';
 import {
@@ -321,9 +320,13 @@ export async function searchBy(
       alert(buildFailureMessage(emptyFailureCounts(), { reason, addedPostCount: 0 }));
       return;
     }
-    // 表示の補助として想定しているのは HTTP エラーと形状の不一致だけ。
+    // 表示の補助として想定しているのは HTTP エラーと、応答を読めなかった/形状が違った場合だけ。
+    // plan / tag はここでだけ ResponseParseError を握りつぶす: 表示の補助しか担っておらず、
+    // 続行しても ZIP の中身は欠けない (投稿一覧・投稿詳細では同じ型で収集を止める)。
     // 想定外の例外は実装上のバグでありうるので、続行せず中止する
-    if (!(e instanceof HttpError || e instanceof ApiShapeError)) return abortCollection(e);
+    if (!(e instanceof HttpError || e instanceof ApiShapeError || e instanceof ResponseParseError)) {
+      return abortCollection(e);
+    }
     console.error('プラン情報の取得に失敗:', e);
   }
   const feeMapper = new Map<number, string>();
@@ -349,7 +352,10 @@ export async function searchBy(
       alert(buildFailureMessage(emptyFailureCounts(), { reason, addedPostCount: 0 }));
       return;
     }
-    if (!(e instanceof HttpError || e instanceof ApiShapeError)) return abortCollection(e);
+    // plan と同じ理由・同じ方針 (上の catch のコメント参照)
+    if (!(e instanceof HttpError || e instanceof ApiShapeError || e instanceof ResponseParseError)) {
+      return abortCollection(e);
+    }
     console.error('タグ情報の取得に失敗:', e);
   }
   let outcome: CollectOutcome;
