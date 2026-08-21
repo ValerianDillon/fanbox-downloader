@@ -215,11 +215,15 @@ export type Transport = (url: string, signal?: AbortSignal) => Promise<Transport
 export const pageOriginTransport: Transport = async (url, _signal) => {
   // 同期 XHR は発行後に中断できない。中断の検出はセッション側が発行の前後で行う
   const xhr = new XMLHttpRequest();
+  // open() は URL の構文エラーで SyntaxError を投げる。これは通信の失敗ではなく
+  // 仕様変更や実装上のバグなので、通信障害に丸めず呼び出し側へ渡す
+  xhr.open('GET', url, false);
+  xhr.withCredentials = true;
   try {
-    xhr.open('GET', url, false);
-    xhr.withCredentials = true;
     xhr.send(null);
   } catch (cause) {
+    // 通信と CORS の失敗は DOMException として上がる。それ以外は想定外なので丸めない
+    if (!(cause instanceof DOMException)) throw cause;
     // 応答を観測できていないので status は推測しない
     return { kind: 'unobservable-failure', cause };
   }
@@ -320,6 +324,29 @@ function waitAbortable(sleep: (ms: number) => Promise<void>, ms: number, signal?
   });
 }
 
+/**
+ * abort されたら即座に reject する。元の Promise は破棄せず、未処理の rejection に
+ * ならないよう握っておく (順序を保つため chain 側では引き続き使われる)。
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  promise.catch(() => undefined);
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
 function abortError(signal: AbortSignal): unknown {
   if (signal.reason !== undefined) return signal.reason;
   const error = new Error('取得を中断しました');
@@ -395,16 +422,25 @@ export class ApiSession {
       }
       this.onSuccess();
       return validated;
-    });
+    }, signal);
   }
 
-  private serialize<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(task, task);
+  /**
+   * 直列化する。順序を保つため chain は必ず先行タスクの完了に繋ぐが、呼び出し側へ返すのは
+   * abort と競争するほうにする。キュー待ちのまま中断できないと、先行タスクが止まったときに
+   * 中断が永久に伝わらない。
+   */
+  private serialize<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const run = this.chain.then(() => {
+      // 順番が回ってきた時点で中断済みなら実行しない
+      throwIfAborted(signal);
+      return task();
+    });
     this.chain = run.then(
       () => undefined,
       () => undefined,
     );
-    return run;
+    return signal ? raceAbort(run, signal) : run;
   }
 
   private async request(url: string, signal?: AbortSignal): Promise<string> {

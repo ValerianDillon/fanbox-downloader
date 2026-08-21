@@ -667,7 +667,13 @@ describe('pageOriginTransport', () => {
   const g = globalThis as any;
   const origXhr = g.XMLHttpRequest;
 
-  type XhrPlan = { throwOnSend?: boolean; status?: number; text?: string; headers?: Record<string, string> };
+  type XhrPlan = {
+    throwOnSend?: unknown;
+    throwOnOpen?: unknown;
+    status?: number;
+    text?: string;
+    headers?: Record<string, string>;
+  };
   let plan: XhrPlan;
   let opened: { method: string; url: string; async: boolean } | undefined;
   let withCredentials: boolean | undefined;
@@ -681,11 +687,12 @@ describe('pageOriginTransport', () => {
       responseText = '';
       withCredentials = false;
       open(method: string, url: string, async: boolean) {
+        if (plan.throwOnOpen) throw plan.throwOnOpen;
         opened = { method, url, async };
       }
       send() {
         withCredentials = this.withCredentials;
-        if (plan.throwOnSend) throw new Error('NetworkError');
+        if (plan.throwOnSend) throw plan.throwOnSend;
         this.status = plan.status ?? 200;
         this.responseText = plan.text ?? '';
       }
@@ -726,10 +733,22 @@ describe('pageOriginTransport', () => {
     });
   });
 
-  test('send が例外なら status を推測せず unobservable-failure にする', async () => {
-    stubXhr({ throwOnSend: true });
+  test('通信の失敗 (DOMException) は status を推測せず unobservable-failure にする', async () => {
+    stubXhr({ throwOnSend: new DOMException('Failed to load', 'NetworkError') });
     const result = await pageOriginTransport('https://api.fanbox.cc/x');
     expect(result.kind).toBe('unobservable-failure');
+  });
+
+  test('send の想定外の例外は通信障害に丸めない', async () => {
+    // 通信・CORS の失敗は DOMException として上がる。それ以外は実装上のバグでありうる
+    stubXhr({ throwOnSend: new TypeError('想定外') });
+    await expect(pageOriginTransport('https://api.fanbox.cc/x')).rejects.toBeInstanceOf(TypeError);
+  });
+
+  test('URL の構文エラーは通信障害に丸めない', async () => {
+    // 一覧の pageUrls は文字列であることしか検証しないので、仕様変更で不正な URL が来うる
+    stubXhr({ throwOnOpen: new DOMException('Invalid URL', 'SyntaxError') });
+    await expect(pageOriginTransport('http://[')).rejects.toBeInstanceOf(DOMException);
   });
 
   test('status 0 も unobservable-failure にする', async () => {
@@ -971,6 +990,33 @@ describe('ApiSession - transport 契約と再試行ポリシー', () => {
     await expect(pending).rejects.toBeDefined();
     // 中断後に追加の要求を出さない
     expect(calls).toBe(1);
+  });
+
+  test('キュー待ちのまま中断できる (先行要求が止まっていても伝わる)', async () => {
+    let releaseFirst!: (result: TransportResult) => void;
+    let calls = 0;
+    const session = new ApiSession(
+      0,
+      () => {
+        calls++;
+        // 1 件目は解決しない。2 件目はキューで待つことになる
+        return new Promise<TransportResult>((resolve) => {
+          releaseFirst = resolve;
+        });
+      },
+      { sleep: async () => {}, now: () => 0 },
+    );
+    const first = session.fetchJson<unknown, unknown>(URL, (j) => j);
+    const controller = new AbortController();
+    const queued = session.fetchJson<unknown, unknown>(URL, (j) => j, controller.signal);
+    // 1 件目が transport に入るまで待つ
+    await Promise.resolve();
+    controller.abort();
+    await expect(queued).rejects.toBeDefined();
+    // 中断しても順序は崩さない: 2 件目は発行されていない
+    expect(calls).toBe(1);
+    releaseFirst({ kind: 'response', status: 200, body: '{}', retryAfter: null });
+    await first;
   });
 
   test('成功が 20 回続いても静穏期間が満たなければ減衰しない', async () => {
