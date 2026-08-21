@@ -232,10 +232,11 @@ describe('buildFailureMessage', () => {
     expect(message).toContain('確認が必要な未取得');
   });
 
-  test('失敗件数が 0 でも打ち切りは伝える', () => {
+  test('1 件も取り込めていない打ち切りは、部分結果があるかのように書かない', () => {
     const message = buildFailureMessage(counts(), { reason: 'transport-exhausted', addedPostCount: 0 }) ?? '';
     expect(message.startsWith('通信に失敗したため途中で打ち切りました')).toBe(true);
-    expect(message).toContain('ここまでに取り込めた投稿: 0 件');
+    expect(message).toContain('取り込めた投稿が無いため、結果は出力しません');
+    expect(message).not.toContain('不完全な結果');
     // ページが分からない経路では位置を書かない
     expect(message).not.toContain('ページ目で停止');
   });
@@ -570,6 +571,35 @@ describe('searchBy - API レスポンスのアンラップと失敗の集計', (
     expect(alerts.join()).toContain('1 ページ目で停止');
   });
 
+  test('レート制限で枯渇したら、部分結果と停止位置を伝えて後続を要求しない', async () => {
+    const responses = baseResponses();
+    responses[LIST_PAGE_URL] = { body: { posts: [listItem('1001'), listItem('1002')] } };
+    responses[postInfoUrl('1002')] = { body: { post: fullPost('1002') } };
+    mockApiWithTransport(async (url) => {
+      // 1 件目は成功させ、2 件目だけ 429 を返し続けて枯渇させる
+      if (url === postInfoUrl('1002')) return { kind: 'response', status: 429, body: '', retryAfter: null };
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url] ?? null), retryAfter: null };
+    });
+    const result = await searchBy(CREATOR_ID, undefined, session);
+    expect(postCount(result)).toBe(1);
+    expect(alerts.join()).toContain('レート制限のため途中で打ち切りました');
+    expect(alerts.join()).toContain('ここまでに取り込めた投稿: 1 件');
+    expect(alerts.join()).toContain('1 ページ目で停止');
+    // 429 は初回 + 3 回再試行で打ち切る
+    expect(requested.filter((u) => u === postInfoUrl('1002'))).toHaveLength(4);
+  });
+
+  test('1 件も取り込めずに枯渇したら結果を返さない', async () => {
+    const responses = baseResponses();
+    mockApiWithTransport(async (url) => {
+      if (url === POST_INFO_URL) return { kind: 'unobservable-failure' };
+      return { kind: 'response', status: 200, body: JSON.stringify(responses[url] ?? null), retryAfter: null };
+    });
+    // plan / tag / paginate / 単一投稿での枯渇と扱いを揃える
+    expect(await searchBy(CREATOR_ID, undefined, session)).toBeUndefined();
+    expect(alerts.join()).toContain('取り込めた投稿が無いため、結果は出力しません');
+  });
+
   test('枯渇後は次の投稿を要求しない', async () => {
     const responses = baseResponses();
     responses[LIST_PAGE_URL] = { body: { posts: [listItem('1001'), listItem('1002')] } };
@@ -740,6 +770,8 @@ describe('pageOriginTransport', () => {
     stubXhr({ throwOnSend: new DOMException('Failed to load', 'NetworkError') });
     const result = await pageOriginTransport('https://api.fanbox.cc/x');
     expect(result.kind).toBe('unobservable-failure');
+    // status を推測して混入させない
+    expect(result).not.toHaveProperty('status');
   });
 
   test('send の想定外の例外は通信障害に丸めない', async () => {

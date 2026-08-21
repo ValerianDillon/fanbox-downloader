@@ -27,7 +27,10 @@ const API_RATE_LIMIT_MS = 500;
 type FailureCounts = {
   /** 閲覧できないため本文を取り込めなかった投稿。支援プランの範囲外など正常系でも起こる */
   restricted: number;
-  /** 投稿詳細を取得できないか、取得できても本文が無かった投稿 */
+  /**
+   * 本文が無かった投稿と、投稿詳細が HTTP エラーだった投稿。
+   * 通信の失敗と CORS は再試行を経て枯渇として伝播するので、ここには合流しない
+   */
   missingBody: number;
   /** 未知の投稿タイプで取り込めなかった投稿 */
   unsupported: number;
@@ -152,6 +155,8 @@ function buildStoppedNotice(stopped: StoppedInfo): string {
       ? 'レート制限のため途中で打ち切りました。'
       : '通信に失敗したため途中で打ち切りました。';
   const where = stopped.page === undefined ? '' : ` (${stopped.page} ページ目で停止)`;
+  // 0 件なら部分結果と呼べるものが無い。「不完全な結果」と言うと、出力があるかのように読める
+  if (stopped.addedPostCount === 0) return `${cause}${where}\n取り込めた投稿が無いため、結果は出力しません。`;
   return `${cause}\nここまでに取り込めた投稿: ${stopped.addedPostCount} 件${where}\n以降は取得していないため、不完全な結果です。`;
 }
 
@@ -645,6 +650,12 @@ export async function searchBy(
     const collected = await getItemsById(session, downloadSettings);
     // 形状エラーで中止したときは、途中までの結果を成功として出さない
     if (!collected) return;
+    // 1 件も取り込めていない打ち切りは、plan / tag / paginate / 単一投稿での枯渇と扱いを揃えて
+    // 結果を返さない。同じ「0 件かつ枯渇」で保存されたりされなかったりするのを避ける
+    if (collected.stopped?.addedPostCount === 0) {
+      alert(buildFailureMessage(collected.failures, collected.stopped));
+      return;
+    }
     outcome = collected;
   }
   downloadSettings.applyTags();
