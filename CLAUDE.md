@@ -27,9 +27,14 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
 - `main()` — ブックマークレットのエントリポイント。URL パターンで動作を分岐
   - `downloads.fanbox.cc` → DownloadHelper UI を起動（download-helper パッケージ）
   - `*.fanbox.cc` / `fanbox.cc/@*` → 投稿情報を収集してクリップボードにコピー
-- `DownloadManage` クラス・`addByPostInfo`（postInfo → DownloadObject への変換）・
-  `convertImageMap` 等は `download-helper/fanbox-collector` から import する共有ロジック
+- `DownloadManage` クラス・`addByPostInfo`（postInfo → DownloadObject への変換）は
+  `download-helper/fanbox-collector` から import する共有ロジック
   （投稿一覧取得・ページネーションなど API 呼び出し自体はこのリポジトリ固有の実装として残る）
+- 検証境界は共有層の `addByPostInfo` の入口にある (ValerianDillon/download-helper#30)。
+  このリポジトリの取得関数が保証するのは収集の分岐に使うフィールドだけで
+  (`getPostInfoById` は `id` / `type` / `isRestricted`、一覧要素は `id` / `isRestricted` / `feeRequired`)、
+  戻り値の型も `PostInfoCandidate` / `PostListItemCandidate` として「検証済み」を名乗らない。
+  本文の検証は `addByPostInfo` が入口で行う
 - `addByPostInfo` が投稿の `publishedDatetime` を `postObject.setPublishedDatetime` で記録するため、
   ZIP 内の各ファイル・フォルダの mtime に投稿日時が反映される
 - FANBOX API (`api.fanbox.cc`) の呼び出しは `ApiSession` に集約する。収集ごとに作り、前回引き上がった発行間隔を持ち越さない

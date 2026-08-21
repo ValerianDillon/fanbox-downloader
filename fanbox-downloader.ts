@@ -13,9 +13,9 @@ import {
   DownloadManage,
   type PlanInfo,
   type PlansResponse,
-  type PostInfo,
+  type PostInfoCandidate,
   type PostInfoResponse,
-  type PostListItem,
+  type PostListItemCandidate,
   type PostListResponse,
   type PostPaginationResponse,
   type TagsResponse,
@@ -471,11 +471,11 @@ async function fetchPostList(
   url: string,
   index: number,
   failures: FailureCounts,
-): Promise<PostListItem[] | undefined> {
+): Promise<PostListItemCandidate[] | undefined> {
   try {
-    return await session.fetchJson<PostListResponse, PostListItem[]>(url, (json) =>
-      unwrapArray<PostListItem>(json?.body?.posts, url, (item) => {
-        const post = item as PostListItem | null;
+    return await session.fetchJson<PostListResponse, PostListItemCandidate[]>(url, (json) =>
+      unwrapArray<PostListItemCandidate>(json?.body?.posts, url, (item) => {
+        const post = item as PostListItemCandidate | null;
         // feeRequired は isIgnoreFree の判断に使うので、欠けていれば形状の不一致として扱う
         return (
           !!post &&
@@ -506,7 +506,7 @@ async function fetchPostList(
 async function addPostList(
   session: ApiSession,
   downloadManage: DownloadManage,
-  postList: PostListItem[],
+  postList: PostListItemCandidate[],
   failures: FailureCounts,
   progress: { addedPostCount: number },
 ): Promise<void> {
@@ -536,11 +536,11 @@ async function addPostList(
  * 投稿IDからpostInfoを得る
  * @param postId 投稿ID
  */
-async function getPostInfoById(session: ApiSession, postId: string): Promise<PostInfo | undefined> {
+async function getPostInfoById(session: ApiSession, postId: string): Promise<PostInfoCandidate | undefined> {
   const url = `https://api.fanbox.cc/post.info?postId=${postId}`;
   try {
-    return await session.fetchJson<PostInfoResponse, PostInfo>(url, (json) => {
-      const post = json?.body?.post;
+    return await session.fetchJson<PostInfoResponse, PostInfoCandidate>(url, (json) => {
+      const post = json?.body?.post as Record<string, unknown> | null | undefined;
       // 形の違いは「取れなかった投稿」ではなく仕様変更とみなす。undefined に丸めると、
       // 全投稿を「支援額不足」と誤報して空の結果を出してしまう。
       // なお閲覧できない投稿も HTTP 200 で投稿オブジェクトを返し、body プロパティは存在したまま
@@ -554,7 +554,8 @@ async function getPostInfoById(session: ApiSession, postId: string): Promise<Pos
       ) {
         throw new ApiShapeError(url);
       }
-      return post;
+      // 検証した 3 つだけを保証する型で返す。本文の検証は addByPostInfo の入口が行う
+      return post as unknown as PostInfoCandidate;
     });
   } catch (e) {
     // 投稿単位の失敗として数えてよいのは HTTP エラーだけ。形状の不一致と枯渇はこの投稿だけの
