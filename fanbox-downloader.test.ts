@@ -57,6 +57,10 @@ describe('DownloadManage', () => {
       m.addFee(500);
       m.addFee(100);
       m.addTags('タグA', 'タグB');
+      // root の tags は選択後の投稿に残っているものだけを出すので (download-helper v8)、
+      // 実際の収集と同じく投稿側にも同じタグを持たせる
+      m.downloadObject.addPost('p1', 'post1').setTags(['ファン', 'タグA']);
+      m.downloadObject.addPost('p2', 'post2').setTags(['サポーター', 'タグB']);
       m.applyTags();
       const json = JSON.parse(m.downloadObject.stringify());
       // fees は昇順ソート (100, 500) → ["ファン", "サポーター"] + 残りのタグ
