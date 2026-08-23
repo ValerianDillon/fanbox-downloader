@@ -37,6 +37,9 @@ pixiv FANBOX の投稿をZIPとして一括ダウンロードするブックマ�
   本文の検証は `addByPostInfo` が入口で行う
 - `addByPostInfo` が投稿の `publishedDatetime` を `postObject.setPublishedDatetime` で記録するため、
   ZIP 内の各ファイル・フォルダの mtime に投稿日時が反映される
+- ZIP のルートに `download-manifest.json` が入る (ValerianDillon/download-helper#42)。
+  `stringify()` は「全件を選択した projection」として実装されており、その選択条件と
+  含めた対象の記録が書き出される。このリポジトリは絞り込み UI を持たないので常に全件になる
 - FANBOX API (`api.fanbox.cc`) の呼び出しは `ApiSession` に集約する。収集ごとに作り、前回引き上がった発行間隔を持ち越さない
   - 全エンドポイントを通し、待機だけでなく発行から応答処理までを直列化する。ゲートだけ排他化すると、待機を終えた複数の呼び出しが同時に発行されうる
   - transport の結果を `response` (status を持つ) と `unobservable-failure` に正規化する。CORS 失敗や通信断では status を推測しない
